@@ -16,11 +16,10 @@ from pykrx import stock as pykrx
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "@saladentnews")
 
-MIN_MARKET_CAP  = 200_000_000_000   # 시총 최소 2,000억
-MIN_ETF_INFLOW  = 10_000_000_000    # 2주 ETF 유입 최소 10억
-TOP_N           = 20                # 최종 선별 종목 수
+MIN_MARKET_CAP  = 200_000_000_000
+MIN_ETF_INFLOW  = 10_000_000_000
+TOP_N           = 20
 
-# 제외 키워드 (레버리지/인버스/해외)
 EXCLUDE_KEYWORDS = [
     "레버리지", "인버스", "2X", "3X", "-1X", "곱버스",
     "해외", "미국", "중국", "일본", "인도", "베트남",
@@ -34,40 +33,45 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
+def get_recent_business_day(days_back=1):
+    date = datetime.today() - timedelta(days=days_back)
+    while date.weekday() >= 5:
+        date -= timedelta(days=1)
+    return date.strftime("%Y%m%d")
+
+
 def get_dates():
-    """분석 기간 (최근 14일) 반환"""
-    end = datetime.today()
-    # 주말/당일 처리 - 최근 거래일로 조정
-    for _ in range(10):
-        end -= timedelta(days=1)
-        if end.weekday() < 5:  # 월~금
-            break
-    start = end - timedelta(days=20)
-    base = end.strftime("%Y%m%d")
-    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), base
+    base = get_recent_business_day(1)
+    base_dt = datetime.strptime(base, "%Y%m%d")
+    start_dt = base_dt - timedelta(days=20)
+    return start_dt.strftime("%Y%m%d"), base, base
 
 
 def is_equity_etf(name: str) -> bool:
-    """국내 주식형 ETF 여부"""
     for kw in EXCLUDE_KEYWORDS:
         if kw in name:
             return False
     return True
 
 
-def get_etf_universe(base_date: str) -> list:
-    """국내 주식형 ETF 리스트"""
+def get_etf_universe() -> list:
     log("ETF 유니버스 수집 중...")
     tickers = []
-    # 최근 5거래일 시도
-    for i in range(5):
+    used_date = None
+
+    for days_back in range(1, 10):
+        date = get_recent_business_day(days_back)
         try:
-            date = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=i)).strftime("%Y%m%d")
-            tickers = pykrx.get_etf_ticker_list(date)
-            if tickers:
-                log(f"  기준일: {date}")
+            log(f"  날짜 {date} 시도...")
+            result = pykrx.get_etf_ticker_list(date)
+            if result and len(result) > 0:
+                tickers = result
+                used_date = date
+                log(f"  → 성공: {date} 기준 {len(tickers)}개 ETF")
                 break
-        except:
+        except Exception as e:
+            log(f"  → {date} 실패: {e}")
+            time.sleep(0.5)
             continue
 
     if not tickers:
@@ -79,34 +83,32 @@ def get_etf_universe(base_date: str) -> list:
         try:
             name = pykrx.get_etf_ticker_name(t)
             if is_equity_etf(name):
-                universe.append({"ticker": t, "name": name})
-            time.sleep(0.05)
+                universe.append({"ticker": t, "name": name, "base_date": used_date})
+            time.sleep(0.03)
         except:
             continue
 
-    log(f"  → 국내 주식형 ETF {len(universe)}개")
+    log(f"  → 국내 주식형 ETF {len(universe)}개 선별")
     return universe
 
 
 def get_etf_net_buy(ticker: str, start: str, end: str) -> float:
-    """ETF 기관 순매수 (2주 합산)"""
     try:
         df = pykrx.get_market_trading_value_by_date(start, end, ticker)
         if df is None or df.empty:
             return 0.0
-        # 기관 순매수 컬럼 탐색
         cols = df.columns.tolist()
-        for col in ["기관합계", "기관", "금융투자"]:
+        for col in ["기관합계", "기관", "금융투자", "투신"]:
             if col in cols:
                 return float(df[col].sum())
-        # 컬럼명이 다를 경우 전체 합산
-        return float(df.iloc[:, 1].sum())  # 두 번째 컬럼 (개인 제외)
+        if len(cols) >= 2:
+            return float(df.iloc[:, 1].sum())
+        return 0.0
     except:
         return 0.0
 
 
 def get_etf_holdings(ticker: str, date: str) -> dict:
-    """ETF 편입 종목 {종목코드: 비중(%)}"""
     try:
         df = pykrx.get_etf_portfolio_deposit_file(ticker, date)
         if df is None or df.empty:
@@ -114,11 +116,17 @@ def get_etf_holdings(ticker: str, date: str) -> dict:
         result = {}
         for _, row in df.iterrows():
             try:
-                row = row.to_dict()
-                # 티커 컬럼 탐색
-                code = str(row.get("티커", row.get("종목코드", ""))).strip().zfill(6)
-                # 비중 컬럼 탐색
-                weight = float(row.get("비중", row.get("구성비중", row.get("편입비중", 0))))
+                row_dict = row.to_dict()
+                code = ""
+                for key in ["티커", "종목코드", "Ticker", "ticker"]:
+                    if key in row_dict:
+                        code = str(row_dict[key]).strip().zfill(6)
+                        break
+                weight = 0.0
+                for key in ["비중", "구성비중", "편입비중", "Weight", "weight"]:
+                    if key in row_dict:
+                        weight = float(row_dict[key])
+                        break
                 if len(code) == 6 and code.isdigit() and weight > 0:
                     result[code] = weight
             except:
@@ -129,9 +137,7 @@ def get_etf_holdings(ticker: str, date: str) -> dict:
 
 
 def get_stock_metrics(ticker: str, start: str, end: str) -> dict:
-    """종목 시총, 현재가, 이격도"""
     try:
-        # 시가총액
         cap_df = pykrx.get_market_cap_by_date(start, end, ticker)
         if cap_df is None or cap_df.empty:
             return {}
@@ -139,7 +145,6 @@ def get_stock_metrics(ticker: str, start: str, end: str) -> dict:
         if market_cap < MIN_MARKET_CAP:
             return {}
 
-        # OHLCV (이격도 계산)
         ohlcv = pykrx.get_market_ohlcv_by_date(start, end, ticker)
         if ohlcv is None or ohlcv.empty or len(ohlcv) < 5:
             return {}
@@ -147,7 +152,6 @@ def get_stock_metrics(ticker: str, start: str, end: str) -> dict:
         current = float(ohlcv["종가"].iloc[-1])
         ma5 = float(ohlcv["종가"].tail(5).mean())
         disparity = (current / ma5 - 1) * 100
-
         name = pykrx.get_market_ticker_name(ticker)
 
         return {
@@ -162,18 +166,14 @@ def get_stock_metrics(ticker: str, start: str, end: str) -> dict:
 
 
 def calc_score(inflow, market_cap, disparity, max_weight, is_focused):
-    """조건 결합 스코어"""
-    base = inflow / 1_000_000_000  # 10억 단위 정규화
-
-    cond1 = disparity < -2.0                   # 단기하락
-    cond2 = market_cap < 1_000_000_000_000     # 중소형주 (1조 미만)
-    cond3 = is_focused                          # 집중투자 ETF
-
+    base = inflow / 1_000_000_000
+    cond1 = disparity < -2.0
+    cond2 = market_cap < 1_000_000_000_000
+    cond3 = is_focused
     if cond1: base *= 1.5
     if cond2: base *= 1.3
     if cond3: base *= 1.4
-    if max_weight >= 5.0: base *= 1.2           # ETF 내 편입 비중 높음
-
+    if max_weight >= 5.0: base *= 1.2
     return base, cond1, cond2, cond3
 
 
@@ -197,7 +197,7 @@ def send_telegram(text: str):
             }, timeout=10)
             time.sleep(0.5)
         except Exception as e:
-            print(f"텔레그램 오류: {e}")
+            log(f"텔레그램 오류: {e}")
 
 
 def main():
@@ -205,19 +205,38 @@ def main():
     log("ETF 수급 스크리너 시작")
     log("=" * 50)
 
+    try:
+        import pykrx as pk_module
+        log(f"pykrx 버전: {pk_module.__version__}")
+    except:
+        pass
+
     start_date, end_date, base_date = get_dates()
     log(f"분석기간: {start_date} ~ {end_date}")
 
     # STEP 1: ETF 유니버스
-    etf_list = get_etf_universe(base_date)
+    etf_list = get_etf_universe()
     if not etf_list:
         log("ETF 리스트 없음. 종료.")
+        send_telegram("❌ ETF 스크리너 오류: ETF 리스트 조회 실패")
         return
+
+    base_date = etf_list[0]["base_date"]
+
+    # PDF 컬럼 구조 디버깅 (첫 실행 시 확인용)
+    log("첫 ETF PDF 컬럼 확인...")
+    try:
+        sample_df = pykrx.get_etf_portfolio_deposit_file(etf_list[0]["ticker"], base_date)
+        if sample_df is not None and not sample_df.empty:
+            log(f"  PDF 컬럼: {sample_df.columns.tolist()}")
+            log(f"  PDF 샘플:\n{sample_df.head(2).to_string()}")
+    except Exception as e:
+        log(f"  PDF 샘플 오류: {e}")
 
     # STEP 2+3: ETF별 순매수 + 편입종목 집계
     log(f"\nETF 자금 유입 및 편입종목 집계 중... ({len(etf_list)}개)")
-    stock_inflow  = {}   # 종목별 ETF 유입 합산
-    stock_weight  = {}   # 종목별 최대 ETF 편입비중
+    stock_inflow   = {}
+    stock_weight   = {}
     focused_stocks = set()
 
     for i, etf in enumerate(etf_list):
@@ -235,7 +254,7 @@ def main():
             time.sleep(0.1)
             continue
 
-        is_focused = len(holdings) <= 20  # 집중투자 ETF
+        is_focused = len(holdings) <= 20
 
         for stk, wt in holdings.items():
             contribution = net_buy * (wt / 100)
@@ -248,9 +267,13 @@ def main():
 
     log(f"\n  → 집계 종목 수: {len(stock_inflow)}개")
 
-    # 최소 유입 필터
     filtered = {k: v for k, v in stock_inflow.items() if v >= MIN_ETF_INFLOW}
     log(f"  → 유입 10억 이상: {len(filtered)}개")
+
+    # 결과 없으면 기준 완화
+    if not filtered:
+        log("필터 통과 종목 없음. 상위 50개로 완화.")
+        filtered = dict(sorted(stock_inflow.items(), key=lambda x: x[1], reverse=True)[:50])
 
     # STEP 4: 종목 정보 수집 + 스코어링
     log(f"\n종목 정보 수집 및 스코어링 중...")
@@ -288,27 +311,27 @@ def main():
         })
         time.sleep(0.05)
 
-    # STEP 5: 정렬 + 선별
     results.sort(key=lambda x: x["score"], reverse=True)
     top = results[:TOP_N]
     log(f"\n  → 조건 충족: {len(results)}개 | 최종 선별: {len(top)}개")
 
-    # STEP 6: 텔레그램 발송
+    # STEP 5: 텔레그램 발송
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
     msg = f"📊 <b>ETF 수급 스크리너</b> | {now}\n"
     msg += f"분석기간: {start_date[4:6]}/{start_date[6:]} ~ {end_date[4:6]}/{end_date[6:]}\n"
     msg += f"선별: <b>{len(top)}종목</b> (전체 충족 {len(results)}개)\n"
     msg += "─" * 28 + "\n\n"
 
-    for i, r in enumerate(top, 1):
-        cap_str = fmt(r["market_cap"])
-        inflow_str = fmt(r["inflow"])
-        msg += (
-            f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
-            f"  ETF유입: {inflow_str} | 이격도: {r['disparity']:+.1f}%\n"
-            f"  시총: {cap_str} | ETF편입비중: {r['max_weight']:.1f}%\n"
-            f"  {r['conds']}\n\n"
-        )
+    if not top:
+        msg += "조건 충족 종목이 없습니다.\n"
+    else:
+        for i, r in enumerate(top, 1):
+            msg += (
+                f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
+                f"  ETF유입: {fmt(r['inflow'])} | 이격도: {r['disparity']:+.1f}%\n"
+                f"  시총: {fmt(r['market_cap'])} | ETF편입비중: {r['max_weight']:.1f}%\n"
+                f"  {r['conds']}\n\n"
+            )
 
     send_telegram(msg)
     log("\n완료!")
