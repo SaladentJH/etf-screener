@@ -24,17 +24,11 @@ jobs:
 
       - name: pykrx 진단
         run: |
-          python << 'PYEOF'
+          python3 -c "
           from pykrx import stock
           from datetime import datetime, timedelta
           import inspect
-          print("=== pykrx 진단 ===")
-          try:
-              import pykrx
-              print(f"버전: {pykrx.__version__}")
-          except:
-              print("버전 확인 불가")
-          print(f"시그니처: {inspect.signature(stock.get_etf_ticker_list)}")
+          print('시그니처:', inspect.signature(stock.get_etf_ticker_list))
           dates = []
           d = datetime.today()
           for _ in range(15):
@@ -43,26 +37,15 @@ jobs:
                   dates.append(d.strftime('%Y%m%d'))
               if len(dates) >= 5:
                   break
-          print(f"테스트 날짜: {dates}")
+          print('테스트날짜:', dates)
           for date in dates:
               try:
                   result = stock.get_etf_ticker_list(date)
-                  print(f"{date}: 성공 {len(result)}개 샘플={result[:2]}")
+                  print(date, '성공', len(result))
                   break
               except Exception as e:
-                  print(f"{date}: {type(e).__name__}: {e}")
-          try:
-              result = stock.get_etf_ticker_list()
-              print(f"날짜없이: 성공 {len(result)}개")
-          except Exception as e:
-              print(f"날짜없이: {type(e).__name__}: {e}")
-          try:
-              df = stock.get_etf_portfolio_deposit_file('102110', dates[0])
-              print(f"ETF PDF: 성공 {len(df)}행 컬럼={df.columns.tolist()}")
-              print(df.head(2).to_string())
-          except Exception as e:
-              print(f"ETF PDF: {type(e).__name__}: {e}")
-          PYEOF
+                  print(date, type(e).__name__, str(e))
+          "
 
       - name: ETF 스크리너 실행
         env:
