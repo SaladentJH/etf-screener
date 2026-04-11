@@ -37,11 +37,14 @@ def log(msg):
 def get_dates():
     """분석 기간 (최근 14일) 반환"""
     end = datetime.today()
-    # 주말이면 금요일로 조정
-    while end.weekday() >= 5:
+    # 주말/당일 처리 - 최근 거래일로 조정
+    for _ in range(10):
         end -= timedelta(days=1)
-    start = end - timedelta(days=20)  # 휴장일 여유 포함
-    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+        if end.weekday() < 5:  # 월~금
+            break
+    start = end - timedelta(days=20)
+    base = end.strftime("%Y%m%d")
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), base
 
 
 def is_equity_etf(name: str) -> bool:
@@ -55,10 +58,20 @@ def is_equity_etf(name: str) -> bool:
 def get_etf_universe(base_date: str) -> list:
     """국내 주식형 ETF 리스트"""
     log("ETF 유니버스 수집 중...")
-    try:
-        tickers = pykrx.get_etf_ticker_list(base_date)
-    except Exception as e:
-        log(f"ETF 리스트 오류: {e}")
+    tickers = []
+    # 최근 5거래일 시도
+    for i in range(5):
+        try:
+            date = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=i)).strftime("%Y%m%d")
+            tickers = pykrx.get_etf_ticker_list(date)
+            if tickers:
+                log(f"  기준일: {date}")
+                break
+        except:
+            continue
+
+    if not tickers:
+        log("ETF 리스트 조회 실패")
         return []
 
     universe = []
