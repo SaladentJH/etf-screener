@@ -59,24 +59,41 @@ def get_etf_universe() -> list:
     tickers = []
     used_date = None
 
-    for days_back in range(1, 10):
+    # 최근 10 거래일 순서로 시도
+    for days_back in range(1, 15):
         date = get_recent_business_day(days_back)
         try:
             log(f"  날짜 {date} 시도...")
-            result = pykrx.get_etf_ticker_list(date)
+            try:
+                result = pykrx.get_etf_ticker_list(date)
+            except TypeError:
+                result = pykrx.get_etf_ticker_list()
             if result and len(result) > 0:
                 tickers = result
                 used_date = date
                 log(f"  → 성공: {date} 기준 {len(tickers)}개 ETF")
                 break
+            else:
+                log(f"  → {date} 결과 없음")
+        except KeyError as e:
+            log(f"  → {date} KeyError({e}) - 다음 날짜 시도")
+            time.sleep(0.3)
+            continue
         except Exception as e:
-            log(f"  → {date} 실패: {e}")
-            time.sleep(0.5)
+            log(f"  → {date} 오류({type(e).__name__}: {e}) - 다음 날짜 시도")
+            time.sleep(0.3)
             continue
 
+    # 그래도 실패하면 날짜 없이 한번 더 시도
     if not tickers:
-        log("ETF 리스트 조회 실패")
-        return []
+        try:
+            log("  날짜 인자 없이 최종 시도...")
+            tickers = pykrx.get_etf_ticker_list()
+            used_date = get_recent_business_day(1)
+            log(f"  → 성공: {len(tickers)}개")
+        except Exception as e:
+            log(f"  → 최종 시도 실패: {e}")
+            return []
 
     universe = []
     for t in tickers:
@@ -223,7 +240,7 @@ def main():
 
     base_date = etf_list[0]["base_date"]
 
-    # PDF 컬럼 구조 디버깅 (첫 실행 시 확인용)
+    # PDF 컬럼 구조 확인 (디버깅)
     log("첫 ETF PDF 컬럼 확인...")
     try:
         sample_df = pykrx.get_etf_portfolio_deposit_file(etf_list[0]["ticker"], base_date)
@@ -270,7 +287,6 @@ def main():
     filtered = {k: v for k, v in stock_inflow.items() if v >= MIN_ETF_INFLOW}
     log(f"  → 유입 10억 이상: {len(filtered)}개")
 
-    # 결과 없으면 기준 완화
     if not filtered:
         log("필터 통과 종목 없음. 상위 50개로 완화.")
         filtered = dict(sorted(stock_inflow.items(), key=lambda x: x[1], reverse=True)[:50])
