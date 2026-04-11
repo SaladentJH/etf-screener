@@ -2,8 +2,8 @@ name: ETF 수급 스크리너
 
 on:
   schedule:
-    - cron: '0 23 * * 0'  # 매주 일요일 23:00 UTC = 월요일 08:00 KST
-  workflow_dispatch:        # 수동 실행 버튼
+    - cron: '0 23 * * 0'
+  workflow_dispatch:
 
 jobs:
   run-screener:
@@ -21,6 +21,48 @@ jobs:
 
       - name: 패키지 설치
         run: pip install -r requirements.txt
+
+      - name: pykrx 진단
+        run: |
+          python << 'PYEOF'
+          from pykrx import stock
+          from datetime import datetime, timedelta
+          import inspect
+          print("=== pykrx 진단 ===")
+          try:
+              import pykrx
+              print(f"버전: {pykrx.__version__}")
+          except:
+              print("버전 확인 불가")
+          print(f"시그니처: {inspect.signature(stock.get_etf_ticker_list)}")
+          dates = []
+          d = datetime.today()
+          for _ in range(15):
+              d -= timedelta(days=1)
+              if d.weekday() < 5:
+                  dates.append(d.strftime('%Y%m%d'))
+              if len(dates) >= 5:
+                  break
+          print(f"테스트 날짜: {dates}")
+          for date in dates:
+              try:
+                  result = stock.get_etf_ticker_list(date)
+                  print(f"{date}: 성공 {len(result)}개 샘플={result[:2]}")
+                  break
+              except Exception as e:
+                  print(f"{date}: {type(e).__name__}: {e}")
+          try:
+              result = stock.get_etf_ticker_list()
+              print(f"날짜없이: 성공 {len(result)}개")
+          except Exception as e:
+              print(f"날짜없이: {type(e).__name__}: {e}")
+          try:
+              df = stock.get_etf_portfolio_deposit_file('102110', dates[0])
+              print(f"ETF PDF: 성공 {len(df)}행 컬럼={df.columns.tolist()}")
+              print(df.head(2).to_string())
+          except Exception as e:
+              print(f"ETF PDF: {type(e).__name__}: {e}")
+          PYEOF
 
       - name: ETF 스크리너 실행
         env:
