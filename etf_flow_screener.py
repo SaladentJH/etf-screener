@@ -1,20 +1,28 @@
 """
-ETF 수급 기반 종목 스크리너 v5.4
+ETF 수급 기반 종목 스크리너 v5.5
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경 (v5.3 → v5.4):
-  - 유동성 필터: 20일 평균거래대금 200억 미만 제외 (MIN_LIQUIDITY_20D)
-  - 수급강도: ETF유입기여 / 5일평균거래대금
-    표시: "수급강도: 21.0x (수급/5일평균거래대금, 단, 거래대금 200억이상)"
-  - 🎯ETF수급 태그 제거 (결과 전체가 ETF수급 기반이라 불필요)
-  - 🔥 태그: 수급강도 3x 이상
-  - 이격도+거래대금 단일 API 호출 (FHKST01010400 재활용, 추가 호출 없음)
+변경 (v5.4 → v5.5):
+  - 실행 모드 변경: COLLECT / ANALYZE 분리 → 매일 COLLECT+ANALYZE 동시 실행
+    매일 COLLECT로 당일 데이터 추가 후 바로 ANALYZE 실행
+    캐시 2일치 미만이면 ANALYZE 스킵 (조용히 넘어감, 텔레그램 발송 안 함)
+    이렇게 하면:
+      월: 금+월(2일치) → 금→월 누적 분석 발송
+      화: 금+월+화(3일치) → 금→화 누적 분석 발송
+      수: 금+월+화+수(4일치) → 금→수 누적 분석 발송
+      목: 5일치 → 금→목 누적 분석 발송
+      금: 6일치 → 전주금→금 주간 전체 분석 발송
+  - yml MODE 환경변수 제거 (항상 COLLECT+ANALYZE)
 
-기존 유지:
-  - ETF 순유입: (상장주수 변화) × NAV
-  - 집중형 ETF 필터: 구성종목 30개 이하
-  - 이격도: 20일
-  - 외인/기관: 요일별 누적 일자별 + 합산
+ETF 순유입 계산:
+  (상장주수(last) - 상장주수(first)) × NAV(last)
+  → 실제 CU 설정/환매에 의한 순유입만 측정, 가격 변동분 제거
+
+집중형 ETF 필터: 구성종목 수 30개 이하 (MAX_ETF_STOCKS)
+유동성 필터: 20일 평균거래대금 200억 미만 제외 (MIN_LIQUIDITY_20D)
+수급강도: ETF유입기여 / 5일평균거래대금
+이격도: 20일 (DISPARITY_PERIOD)
+외인/기관: 요일별 누적 일자별 + 합산 (월=1일 ~ 금=5일)
 """
 
 import os
@@ -31,7 +39,6 @@ KIS_APP_KEY        = os.environ.get("KIS_APP_KEY", "")
 KIS_APP_SECRET     = os.environ.get("KIS_APP_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "@saladentnews")
-RUN_MODE           = os.environ.get("MODE", "")
 
 KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
@@ -39,12 +46,11 @@ AUM_CACHE_FILE = "etf_aum_cache.json"
 # ─── 분석 파라미터 ─────────────────────────────────────
 MIN_STOCK_INFLOW  = 3_000_000_000    # 종목 최소 ETF 유입 기여액 (3억)
 MIN_LIQUIDITY_20D = 20_000_000_000   # 20일 평균거래대금 최소 기준 (200억)
-                                     # 종목당 1~5억 운용 기준, 200억 미만 제외
-TOP_ETF_N         = 30               # 주간 순유입 상위 ETF 수
+TOP_ETF_N         = 30               # 순유입 상위 ETF 수
 CANDIDATE_N       = 30               # KIS 조회 후보 종목 수
 TOP_N             = 30               # 최종 발송 종목 수
-LOOKBACK_DAYS     = 7                # 주간 분석 기간 (캘린더 기준)
-DISPARITY_PERIOD  = 20               # 이격도 이동평균 기간 (미래에셋 리포트: 20일)
+LOOKBACK_DAYS     = 7                # 캐시 조회 기간 (캘린더 기준)
+DISPARITY_PERIOD  = 20               # 이격도 이동평균 기간 (20일)
 DISPARITY_THRESH  = -2.0             # 이격도 단기하락 기준 (%)
 MAX_ETF_STOCKS    = 30               # 집중형 ETF 기준: 구성종목 수 30개 이하
 FLOW_INTENSITY_HI = 3.0              # 수급강도 고강도 기준 (3x 이상 → 🔥)
@@ -75,17 +81,15 @@ def is_valid_etf(name: str) -> bool:
 
 
 def get_recent_business_day(days_back: int = 1) -> str:
+    """days_back 영업일 전 날짜 반환 (주말 skip)"""
     date = datetime.today() - timedelta(days=days_back)
     while date.weekday() >= 5:
         date -= timedelta(days=1)
     return date.strftime("%Y%m%d")
 
 
-def is_friday() -> bool:
-    return datetime.today().weekday() == 4
-
-
 def get_investor_days() -> int:
+    """오늘 요일 기준 표시 영업일 수 (월=1 ~ 금=5)"""
     return INVESTOR_DAYS_BY_WEEKDAY.get(datetime.today().weekday(), 5)
 
 
@@ -401,28 +405,20 @@ def send_telegram(text: str):
             log(f"텔레그램 오류: {e}")
 
 
-# ─── COLLECT 모드 ─────────────────────────────────────
+# ─── COLLECT ─────────────────────────────────────────
 
-def run_collect():
-    log("=" * 50)
-    log("[COLLECT 모드] ETF 상장주수 + NAV + 구성종목수 수집")
-    log("=" * 50)
+def run_collect(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
+    """
+    ETF 상장주수(lstn_stcn) + NAV + 구성종목수 수집 → 캐시 저장.
+    성공 여부 반환.
+    """
+    log("─" * 40)
+    log(f"[COLLECT] 기준일: {base_date}")
 
-    base_date = get_recent_business_day(1)
-    log(f"기준일: {base_date}")
-
-    krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
     etf_info = get_etf_universe(krx, base_date)
     if not etf_info:
         log("ETF 유니버스 조회 실패")
-        return
-
-    log("KIS 토큰 발급 중...")
-    token = get_kis_token()
-    if not token:
-        log("KIS 토큰 실패")
-        return
-    log("  → 토큰 발급 성공")
+        return False
 
     log(f"ETF 데이터 수집 중... ({len(etf_info)}개)")
     today_data = get_etf_data_today(list(etf_info.keys()), token)
@@ -435,40 +431,37 @@ def run_collect():
     cache = prune_cache(cache, keep_days=14)
     save_aum_cache(cache)
 
-    log(f"캐시 저장 완료 → {AUM_CACHE_FILE}")
-    log(f"저장된 날짜: {sorted(cache.keys())}")
-    log("완료!")
+    log(f"캐시 저장 완료 | 보유 날짜: {sorted(cache.keys())}")
+    return True
 
 
-# ─── ANALYZE 모드 ─────────────────────────────────────
+# ─── ANALYZE ─────────────────────────────────────────
 
-def run_analyze():
-    log("=" * 50)
-    log("[ANALYZE 모드] ETF 수급 스크리너 v5.4 분석")
-    log("=" * 50)
+def run_analyze(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
+    """
+    캐시에서 누적 순유입 계산 → 집중형 ETF 필터 → 편입종목 역추적 → 발송.
+    캐시 2일치 미만이면 조용히 스킵 (False 반환).
+    """
+    log("─" * 40)
+    log("[ANALYZE] ETF 수급 스크리너 v5.5 분석")
 
-    base_date     = get_recent_business_day(1)
-    cutoff_dt     = datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)
-    cutoff        = cutoff_dt.strftime("%Y%m%d")
-    investor_days = get_investor_days()
-    weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
-    liq_label     = fmt(MIN_LIQUIDITY_20D)   # "200억"
-    log(f"분석기간: {cutoff} ~ {base_date}")
-    log(f"외인/기관 표시: {weekday_name}요일 기준 최근 {investor_days}영업일")
+    cutoff_dt = datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)
+    cutoff    = cutoff_dt.strftime("%Y%m%d")
 
-    # ── 캐시에서 주간 순유입 계산 ──────────────────────
     cache = load_aum_cache()
     available_dates = sorted([d for d in cache.keys() if d >= cutoff and d <= base_date])
-    log(f"캐시 보유 날짜: {available_dates}")
+    log(f"캐시 보유 날짜: {available_dates} ({len(available_dates)}일치)")
 
+    # 2일치 미만이면 스킵 (월요일 첫 실행 등)
     if len(available_dates) < 2:
-        log("캐시 데이터 부족 (최소 2일치). COLLECT 먼저 실행하세요.")
-        send_telegram("❌ ETF 스크리너 v5.4: 캐시 데이터 부족.")
-        return
+        log("캐시 데이터 부족 (최소 2일치 필요) → ANALYZE 스킵")
+        return False
 
     first_data = cache[available_dates[0]]
     last_data  = cache[available_dates[-1]]
+    period_str = f"{available_dates[0][4:6]}/{available_dates[0][6:]} ~ {available_dates[-1][4:6]}/{available_dates[-1][6:]}"
 
+    # 실제 순유입 = 상장주수 변화 × NAV + 집중형 필터
     etf_inflow   = {}
     filtered_cnt = 0
     for ticker in set(first_data.keys()) | set(last_data.keys()):
@@ -484,10 +477,8 @@ def run_analyze():
             continue
         etf_inflow[ticker] = stcn_change * nav_t
 
-    log(f"주간 순유입 집중형 ETF: {len(etf_inflow)}개 (지수형 제외: {filtered_cnt}개)")
+    log(f"순유입 집중형 ETF: {len(etf_inflow)}개 (지수형 제외: {filtered_cnt}개)")
 
-    # ── ETF 유니버스 ─────────────────────────────────────
-    krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
     etf_info = get_etf_universe(krx, base_date)
 
     top_etfs = sorted(
@@ -501,16 +492,8 @@ def run_analyze():
         log(f"  {i}. {etf_info.get(t, {}).get('name', t)} ({t}) | 구성{cnt}종목 | +{fmt(v)}")
 
     if not top_etfs:
-        send_telegram("❌ ETF 스크리너 v5.4: 조건 충족 집중형 ETF 없음")
-        return
-
-    # ── KIS 토큰 ──────────────────────────────────────────
-    log("\nKIS 토큰 발급 중...")
-    token = get_kis_token()
-    if not token:
-        send_telegram("❌ ETF 스크리너 v5.4: KIS 토큰 실패")
-        return
-    log("  → 토큰 발급 성공")
+        log("선정된 ETF 없음")
+        return False
 
     # ── 편입종목 역추적 ──────────────────────────────────
     log("\n편입종목 역추적 중...")
@@ -533,8 +516,7 @@ def run_analyze():
     log(f"  → PDF 성공: {pdf_ok}/{len(top_etfs)} | 집계 종목: {len(stock_inflow)}개")
 
     if pdf_ok == 0:
-        send_telegram("❌ ETF 스크리너 v5.4: 편입종목 조회 실패")
-        return
+        return False
 
     # ── 종목 정보 수집 ────────────────────────────────────
     log("\n종목 정보 수집 중...")
@@ -556,34 +538,34 @@ def run_analyze():
     log(f"  → 후보 종목: {len(top_candidates)}개")
 
     # ── 이격도 + 거래대금 + 투자자 수집 ─────────────────────
+    investor_days = get_investor_days()
+    weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
+    liq_label     = fmt(MIN_LIQUIDITY_20D)
     log(f"\n이격도({DISPARITY_PERIOD}일) + 거래대금(5/20일) + 투자자({investor_days}일) 수집 중...")
+
     results      = []
     liq_filtered = 0
 
     for c in top_candidates:
         ticker = c["ticker"]
 
-        # 이격도 + 5일/20일 거래대금 (단일 API 호출)
         price_data  = get_disparity_and_volume(ticker, token)
         disp        = price_data["disparity"]
         vol_5d_avg  = price_data["vol_5d_avg"]
         vol_20d_avg = price_data["vol_20d_avg"]
 
-        # 유동성 필터: 20일 평균거래대금 MIN_LIQUIDITY_20D 미만 제외
+        # 유동성 필터
         if vol_20d_avg > 0 and vol_20d_avg < MIN_LIQUIDITY_20D:
             liq_filtered += 1
             time.sleep(0.05)
             continue
 
-        # 수급강도: ETF유입기여 / 5일평균거래대금
         intensity = (c["inflow"] / vol_5d_avg) if vol_5d_avg > 0 else 0.0
 
-        # 투자자 순매수 (일자별)
         investor = get_investor_net_buy_daily(ticker, token, days=investor_days)
         frgn_sum = investor["frgn_sum"]
         orgn_sum = investor["orgn_sum"]
 
-        # 태그 (🎯ETF수급 제거 — 결과 전체가 ETF수급 기반)
         tags = []
         if c["mktcap"] > 0 and c["mktcap"] < 1_000_000_000_000:
             tags.append("🔹소형주")
@@ -615,8 +597,8 @@ def run_analyze():
 
     # ── 텔레그램 발송 ─────────────────────────────────────
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.4</b> | {now}\n"
-    msg += f"분석기간: {cutoff[4:6]}/{cutoff[6:]} ~ {base_date[4:6]}/{base_date[6:]} ({len(available_dates)}일)\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.5</b> | {now}\n"
+    msg += f"분석기간: {period_str} ({len(available_dates)}일치 누적)\n"
     msg += f"집중형 ETF {len(top_etfs)}개 실제 순유입 역추적 → <b>{len(top)}개 종목</b> 선별\n"
     msg += f"유동성 필터: 20일평균 {liq_label} 미만 제외 ({liq_filtered}개 제거)\n"
     msg += f"외인/기관: {weekday_name}요일 기준 최근 {investor_days}영업일 일자별\n"
@@ -645,7 +627,7 @@ def run_analyze():
             )
 
     send_telegram(msg)
-    log("\n완료!")
+    return True
 
 
 # ─── 메인 ────────────────────────────────────────────
@@ -658,17 +640,31 @@ def main():
         log("KIS_APP_KEY/SECRET 없음. 종료.")
         return
 
-    mode = RUN_MODE.upper()
-    if not mode:
-        mode = "ANALYZE" if is_friday() else "COLLECT"
-    log(f"실행 모드: {mode}")
+    base_date = get_recent_business_day(1)
+    log("=" * 50)
+    log(f"ETF 수급 스크리너 v5.5 | 기준일: {base_date}")
+    log("=" * 50)
 
-    if mode == "COLLECT":
-        run_collect()
-    elif mode == "ANALYZE":
-        run_analyze()
-    else:
-        log(f"알 수 없는 MODE: {mode}")
+    # KIS 토큰 (COLLECT + ANALYZE 공유)
+    log("KIS 토큰 발급 중...")
+    token = get_kis_token()
+    if not token:
+        log("KIS 토큰 실패. 종료.")
+        return
+    log("  → 토큰 발급 성공")
+
+    # KRX 클라이언트 (COLLECT + ANALYZE 공유)
+    krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
+
+    # COLLECT → ANALYZE 순서 실행
+    collect_ok = run_collect(krx, token, base_date)
+    if not collect_ok:
+        log("COLLECT 실패. ANALYZE 스킵.")
+        return
+
+    log("")
+    run_analyze(krx, token, base_date)
+    log("\n완료!")
 
 
 if __name__ == "__main__":
