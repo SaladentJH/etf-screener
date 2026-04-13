@@ -3,8 +3,14 @@ ETF 수급 기반 종목 스크리너 v4
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
 추가 데이터:
-  - 외국인/기관 당일 순매수 (KIS inquire_investor)
+  - 외국인/기관 당일 순매수 (KIS inquire_investor) - 단위 백만원 × 1,000,000 = 원
   - 5일 이격도 (KIS inquire_daily_price 기반 직접 계산)
+
+출력 형식:
+  1. 삼성전자 (005930)
+     ETF유입기여: 7.5조 | 이격도: -3.2% 📉
+     외국인: +2,879억 | 기관: -4,458억
+     시총: 1,219조 | 🎯ETF수급
 """
 
 import os
@@ -142,10 +148,12 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 
 # ─── KIS 투자자별 순매수 ──────────────────────────────
 
-_investor_debug_done = False  # 첫 종목만 디버그
-
 def get_investor_net_buy(ticker: str, token: str) -> dict:
-    global _investor_debug_done
+    """
+    FHKST01010900 - inquire_investor
+    output[0] = 당일 데이터
+    frgn_ntby_tr_pbmn / orgn_ntby_tr_pbmn 단위: 백만원 → × 1,000,000 하여 원 단위로 변환
+    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor",
         "FHKST01010900",
@@ -153,25 +161,13 @@ def get_investor_net_buy(ticker: str, token: str) -> dict:
         token,
     )
     output = data.get("output", [])
-
-    # 첫 번째 종목만 응답 구조 출력
-    if not _investor_debug_done:
-        _investor_debug_done = True
-        log(f"  [INVESTOR DEBUG {ticker}] rt_cd={data.get('rt_cd')} msg1={data.get('msg1','')[:60]}")
-        log(f"  [INVESTOR DEBUG {ticker}] output 길이={len(output)}")
-        if output:
-            log(f"  [INVESTOR DEBUG {ticker}] output[0] keys={list(output[0].keys())}")
-            log(f"  [INVESTOR DEBUG {ticker}] output[0]={output[0]}")
-        else:
-            log(f"  [INVESTOR DEBUG {ticker}] output 비어있음. 전체 응답={data}")
-
     if not output:
         return {"frgn": 0, "orgn": 0}
-
     row = output[0]
     try:
-        frgn = float(str(row.get("frgn_ntby_tr_pbmn", 0) or 0))
-        orgn = float(str(row.get("orgn_ntby_tr_pbmn", 0) or 0))
+        # 단위: 백만원 → × 1,000,000 = 원
+        frgn = float(str(row.get("frgn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
+        orgn = float(str(row.get("orgn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
         return {"frgn": frgn, "orgn": orgn}
     except:
         return {"frgn": 0, "orgn": 0}
@@ -180,6 +176,10 @@ def get_investor_net_buy(ticker: str, token: str) -> dict:
 # ─── KIS 이격도 계산 ──────────────────────────────────
 
 def get_disparity(ticker: str, token: str, n: int = 5) -> float:
+    """
+    FHKST01010400 - inquire_daily_price
+    최근 n+1일 종가 → 현재가 / n일 이동평균 - 1
+    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
         "FHKST01010400",
@@ -305,6 +305,7 @@ def get_stock_info_bulk(client: KRXOpenAPI, base_date: str) -> dict:
 def fmt(n: float) -> str:
     if abs(n) >= 1e12: return f"{n/1e12:.1f}조"
     if abs(n) >= 1e8:  return f"{n/1e8:.0f}억"
+    if abs(n) >= 1e4:  return f"{n/1e4:.0f}만"
     return f"{n:,.0f}"
 
 
