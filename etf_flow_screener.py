@@ -1,19 +1,19 @@
 """
-ETF 수급 기반 종목 스크리너 v5
+ETF 수급 기반 종목 스크리너 v5.1
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-핵심 변경 (v4 → v5):
-  - ETF 순유입 측정 기준 변경
-    v4: ETF 거래대금(ACC_TRDVAL) 합산 → 매수+매도 합산이라 방향성 없음
-    v5: ETF 순자산 변화(etf_ntas_ttam 일별 증감) → 실제 AUM 유입/유출
+변경 (v5 → v5.1):
+  - 지수형 ETF 제외: COLLECT 단계에서 etf_cnfg_issu_cnt(구성종목 수) 함께 수집
+  - MAX_ETF_STOCKS = 30 초과 ETF 제외 → 섹터/테마형 집중형 ETF만 분석
+  - 이격도: 20일 (DISPARITY_PERIOD = 20)
 
-  - 실행 모드 분리
-    COLLECT 모드 (매 영업일): 전체 ETF AUM 수집 → etf_aum_cache.json 저장
-    ANALYZE 모드 (금요일):    캐시에서 주간 AUM 변화 합산 → 편입종목 역추적 → 발송
+실행 모드:
+  COLLECT (매 영업일 16:30 KST): ETF AUM + 구성종목수 수집 → etf_aum_cache.json 저장
+  ANALYZE (금요일 16:30 KST):    캐시 주간 AUM 변화 계산 → 집중형 ETF 필터 → 편입종목 역추적 → 발송
 
 외국인/기관 순매수(개별종목):
-  - 기존과 동일하게 유지 (보조 필터 태그로 활용)
-  - frgn_ntby_tr_pbmn / orgn_ntby_tr_pbmn (단위: 백만원 × 1,000,000 = 원)
+  - 보조 필터 태그로 유지
+  - 단위: frgn_ntby_tr_pbmn / orgn_ntby_tr_pbmn = 백만원 × 1,000,000 = 원
 """
 
 import os
@@ -32,15 +32,18 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "@saladentnews")
 RUN_MODE           = os.environ.get("MODE", "")   # COLLECT / ANALYZE / 빈값(자동)
 
-KIS_BASE_URL       = "https://openapi.koreainvestment.com:9443"
-AUM_CACHE_FILE     = "etf_aum_cache.json"   # 일별 AUM 저장 파일
+KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
+AUM_CACHE_FILE = "etf_aum_cache.json"
 
-# 분석 파라미터
+# ─── 분석 파라미터 ─────────────────────────────────────
 MIN_STOCK_INFLOW = 3_000_000_000   # 종목 최소 ETF 유입 기여액 (3억)
 TOP_ETF_N        = 30              # 주간 AUM 증가 상위 ETF 수
 CANDIDATE_N      = 30              # KIS 조회 후보 종목 수
 TOP_N            = 30              # 최종 발송 종목 수
 LOOKBACK_DAYS    = 7               # 주간 분석 기간 (캘린더 기준)
+DISPARITY_PERIOD = 20              # 이격도 이동평균 기간 (미래에셋 리포트: 20일)
+DISPARITY_THRESH = -2.0            # 이격도 단기하락 기준 (%)
+MAX_ETF_STOCKS   = 30              # 집중형 ETF 기준: 구성종목 수 30개 이하만 허용
 
 EXCLUDE_KEYWORDS = [
     "레버리지", "인버스", "2X", "3X", "-1X", "곱버스",
@@ -50,7 +53,7 @@ EXCLUDE_KEYWORDS = [
     "머니마켓", "MMF", "단기", "CD금리", "KOFR", "SOFR",
     "부동산", "리츠", "REIT",
 ]
-# ─────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 
 
 def log(msg):
@@ -102,9 +105,9 @@ def find_col(df, keywords):
 
 
 # ─── AUM 캐시 ────────────────────────────────────────
+# 캐시 구조: {날짜: {ticker: {"aum": 원, "cnt": 구성종목수}}}
 
 def load_aum_cache() -> dict:
-    """etf_aum_cache.json 로드. {날짜: {ticker: aum_원}}"""
     if os.path.exists(AUM_CACHE_FILE):
         with open(AUM_CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -117,7 +120,6 @@ def save_aum_cache(cache: dict):
 
 
 def prune_cache(cache: dict, keep_days: int = 14) -> dict:
-    """14일 초과 과거 데이터 삭제"""
     cutoff = (datetime.today() - timedelta(days=keep_days)).strftime("%Y%m%d")
     return {d: v for d, v in cache.items() if d >= cutoff}
 
@@ -151,15 +153,17 @@ def kis_get(path: str, tr_id: str, params: dict, token: str) -> dict:
         return {}
 
 
-# ─── KIS ETF AUM 수집 ────────────────────────────────
+# ─── KIS ETF AUM + 구성종목수 수집 ───────────────────
 
 def get_etf_aum_today(etf_tickers: list, token: str) -> dict:
     """
     FHPST02400000 (ETF/ETN 현재가)
-    etf_ntas_ttam: ETF 순자산 총액 (단위: 원)
-    전체 ETF 대상으로 AUM 수집
+    수집 필드:
+      etf_ntas_ttam    : ETF 순자산 총액 (원)  → AUM 변화 계산에 사용
+      etf_cnfg_issu_cnt: ETF 구성종목 수       → 집중형 필터에 사용 (≤ MAX_ETF_STOCKS)
+    반환: {ticker: {"aum": float, "cnt": int}}
     """
-    aum_dict = {}
+    result = {}
     for i, ticker in enumerate(etf_tickers):
         data = kis_get(
             "/uapi/etfetn/v1/quotations/inquire-price",
@@ -170,16 +174,19 @@ def get_etf_aum_today(etf_tickers: list, token: str) -> dict:
         output = data.get("output", {})
         try:
             aum_raw = str(output.get("etf_ntas_ttam", "0") or "0").replace(",", "")
+            cnt_raw = str(output.get("etf_cnfg_issu_cnt", "0") or "0").replace(",", "")
             aum = float(aum_raw)
+            cnt = int(float(cnt_raw))
             if aum > 0:
-                aum_dict[ticker] = aum
+                result[ticker] = {"aum": aum, "cnt": cnt}
         except:
             pass
         # Rate limit: 초당 5회 이하
         if (i + 1) % 5 == 0:
             time.sleep(1.1)
-    log(f"  → AUM 수집: {len(aum_dict)}개 ETF")
-    return aum_dict
+
+    log(f"  → AUM 수집: {len(result)}개 ETF")
+    return result
 
 
 # ─── KIS ETF 구성종목 ─────────────────────────────────
@@ -206,8 +213,8 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 def get_investor_net_buy(ticker: str, token: str) -> dict:
     """
     FHKST01010900 - 주식현재가 투자자
-    개별 종목 기준 외국인/기관 순매수 (보조 필터 태그용)
-    단위: frgn_ntby_tr_pbmn, orgn_ntby_tr_pbmn = 백만원 × 1,000,000 = 원
+    개별 종목 외국인/기관 순매수 (보조 태그용)
+    단위: 백만원 × 1,000,000 = 원
     """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor",
@@ -227,12 +234,13 @@ def get_investor_net_buy(ticker: str, token: str) -> dict:
         return {"frgn": 0, "orgn": 0}
 
 
-# ─── KIS 이격도 계산 ──────────────────────────────────
+# ─── KIS 이격도 계산 (20일) ───────────────────────────
 
-def get_disparity(ticker: str, token: str, n: int = 5) -> float:
+def get_disparity(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> float:
     """
     FHKST01010400 - 일별 종가 기반 n일 이격도
     현재가 / n일 이동평균 - 1
+    기본값: 20일 (미래에셋 리포트 원본 기준)
     """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
@@ -249,7 +257,7 @@ def get_disparity(ticker: str, token: str, n: int = 5) -> float:
         if any(p == 0 for p in prices):
             return 0.0
         current = prices[0]
-        ma_n = sum(prices[:n]) / n
+        ma_n    = sum(prices[:n]) / n
         return (current / ma_n - 1) * 100
     except:
         return 0.0
@@ -348,10 +356,10 @@ def send_telegram(text: str):
 def run_collect():
     """
     매 영업일 장마감 후 실행.
-    전체 ETF의 etf_ntas_ttam(순자산 총액)을 수집하여 캐시에 저장.
+    전체 ETF의 AUM(etf_ntas_ttam) + 구성종목수(etf_cnfg_issu_cnt) 수집 → 캐시 저장.
     """
     log("=" * 50)
-    log("[COLLECT 모드] ETF AUM 수집")
+    log("[COLLECT 모드] ETF AUM + 구성종목수 수집")
     log("=" * 50)
 
     base_date = get_recent_business_day(1)
@@ -370,10 +378,13 @@ def run_collect():
         return
     log("  → 토큰 발급 성공")
 
-    log(f"ETF AUM 수집 중... ({len(etf_info)}개)")
+    log(f"ETF AUM + 구성종목수 수집 중... ({len(etf_info)}개)")
     aum_today = get_etf_aum_today(list(etf_info.keys()), token)
 
-    # 캐시에 저장
+    # 집중형 ETF 비율 로그
+    concentrated = sum(1 for v in aum_today.values() if v["cnt"] <= MAX_ETF_STOCKS)
+    log(f"  → 집중형 (≤{MAX_ETF_STOCKS}종목): {concentrated}개 / 전체 {len(aum_today)}개")
+
     cache = load_aum_cache()
     cache[base_date] = aum_today
     cache = prune_cache(cache, keep_days=14)
@@ -389,10 +400,10 @@ def run_collect():
 def run_analyze():
     """
     금요일 장마감 후 실행.
-    캐시에서 주간 AUM 변화를 계산 → 편입종목 역추적 → 발송.
+    캐시에서 주간 AUM 변화 계산 → 집중형 ETF만 필터 → 편입종목 역추적 → 발송.
     """
     log("=" * 50)
-    log("[ANALYZE 모드] ETF 수급 스크리너 v5 분석")
+    log("[ANALYZE 모드] ETF 수급 스크리너 v5.1 분석")
     log("=" * 50)
 
     base_date = get_recent_business_day(1)
@@ -407,50 +418,52 @@ def run_analyze():
 
     if len(available_dates) < 2:
         log("캐시 데이터 부족 (최소 2일치 필요). COLLECT 모드를 먼저 실행하세요.")
-        send_telegram("❌ ETF 스크리너 v5: 캐시 데이터 부족. 매일 COLLECT 실행 필요.")
+        send_telegram("❌ ETF 스크리너 v5.1: 캐시 데이터 부족. 매일 COLLECT 실행 필요.")
         return
 
-    # 기간 내 첫날 vs 마지막날 AUM 비교로 주간 순변화 계산
-    first_date = available_dates[0]
-    last_date  = available_dates[-1]
-    first_aum  = cache[first_date]
-    last_aum   = cache[last_date]
+    first_data = cache[available_dates[0]]   # {ticker: {"aum": x, "cnt": n}}
+    last_data  = cache[available_dates[-1]]
 
+    # 주간 AUM 순변화 계산 + 집중형 필터 동시 적용
     etf_aum_change = {}
-    all_tickers = set(first_aum.keys()) | set(last_aum.keys())
-    for ticker in all_tickers:
-        a0 = first_aum.get(ticker, 0)
-        a1 = last_aum.get(ticker, 0)
+    filtered_index = 0
+    for ticker in set(first_data.keys()) | set(last_data.keys()):
+        a0   = first_data.get(ticker, {}).get("aum", 0)
+        a1   = last_data.get(ticker, {}).get("aum", 0)
+        cnt  = last_data.get(ticker, {}).get("cnt", 999)   # 없으면 큰 수로 처리
         change = a1 - a0
-        if change > 0:   # 순유입만
-            etf_aum_change[ticker] = change
+        if change <= 0:
+            continue
+        if cnt > MAX_ETF_STOCKS:   # 지수형 제외
+            filtered_index += 1
+            continue
+        etf_aum_change[ticker] = change
 
-    log(f"주간 AUM 순증 ETF: {len(etf_aum_change)}개")
+    log(f"주간 AUM 순증 ETF: {len(etf_aum_change)}개 (지수형 제외: {filtered_index}개)")
 
-    # ── ETF 유니버스 ─────────────────────────────────────
+    # ── ETF 유니버스 (이름 조회용) ────────────────────────
     krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
     etf_info = get_etf_universe(krx, base_date)
 
-    # 유효 ETF 필터 + 상위 N개 선별
     top_etfs = sorted(
         [(t, v) for t, v in etf_aum_change.items() if t in etf_info],
         key=lambda x: x[1], reverse=True
     )[:TOP_ETF_N]
 
-    log(f"상위 {len(top_etfs)}개 ETF 선정 (AUM 순유입 기준)")
+    log(f"상위 {len(top_etfs)}개 집중형 ETF 선정 (AUM 순유입 기준)")
     for i, (t, v) in enumerate(top_etfs[:5], 1):
-        log(f"  {i}. {etf_info.get(t, {}).get('name', t)} ({t}) → +{fmt(v)}")
+        cnt = last_data.get(t, {}).get("cnt", "?")
+        log(f"  {i}. {etf_info.get(t, {}).get('name', t)} ({t}) | 구성{cnt}종목 | +{fmt(v)}")
 
     if not top_etfs:
-        log("선정된 ETF 없음")
-        send_telegram("❌ ETF 스크리너 v5: 주간 AUM 순유입 ETF 없음")
+        send_telegram("❌ ETF 스크리너 v5.1: 조건 충족 집중형 ETF 없음")
         return
 
     # ── KIS 토큰 ──────────────────────────────────────────
     log("\nKIS 토큰 발급 중...")
     token = get_kis_token()
     if not token:
-        send_telegram("❌ ETF 스크리너 v5: KIS 토큰 실패")
+        send_telegram("❌ ETF 스크리너 v5.1: KIS 토큰 실패")
         return
     log("  → 토큰 발급 성공")
 
@@ -467,16 +480,15 @@ def run_analyze():
         pdf_ok += 1
         total_wt = sum(h["weight"] for h in holdings)
         for h in holdings:
-            stk     = h["ticker"]
             wt      = h["weight"] / total_wt if total_wt > 0 else 0
-            contrib = aum_change * wt   # AUM 증가분 × 편입비중 = 종목별 기여액
-            stock_inflow[stk] = stock_inflow.get(stk, 0) + contrib
+            contrib = aum_change * wt   # AUM 증가분 × 편입비중
+            stock_inflow[h["ticker"]] = stock_inflow.get(h["ticker"], 0) + contrib
         time.sleep(0.15)
 
     log(f"  → PDF 성공: {pdf_ok}/{len(top_etfs)} | 집계 종목: {len(stock_inflow)}개")
 
     if pdf_ok == 0:
-        send_telegram("❌ ETF 스크리너 v5: 편입종목 조회 실패")
+        send_telegram("❌ ETF 스크리너 v5.1: 편입종목 조회 실패")
         return
 
     # ── 종목 정보 수집 ────────────────────────────────────
@@ -498,8 +510,8 @@ def run_analyze():
     top_candidates = candidates[:CANDIDATE_N]
     log(f"  → 후보 종목: {len(top_candidates)}개")
 
-    # ── 투자자 순매수(개별종목 보조) + 이격도 수집 ──────────
-    log("\n투자자 순매수(개별종목 보조) + 이격도 수집 중...")
+    # ── 투자자 순매수(보조) + 이격도(20일) 수집 ─────────────
+    log(f"\n투자자 순매수(보조) + 이격도({DISPARITY_PERIOD}일) 수집 중...")
     results = []
 
     for c in top_candidates:
@@ -507,12 +519,12 @@ def run_analyze():
         investor = get_investor_net_buy(ticker, token)
         frgn     = investor["frgn"]
         orgn     = investor["orgn"]
-        disp     = get_disparity(ticker, token, n=5)
+        disp     = get_disparity(ticker, token)   # 기본값 DISPARITY_PERIOD=20일
 
         tags = ["🎯ETF수급"]
         if c["mktcap"] > 0 and c["mktcap"] < 1_000_000_000_000:
             tags.append("🔹소형주")
-        if disp < -2.0:
+        if disp < DISPARITY_THRESH:
             tags.append("📉단기하락")
         if frgn > 0:
             tags.append("🌐외국인↑")
@@ -528,9 +540,10 @@ def run_analyze():
 
     # ── 텔레그램 발송 ─────────────────────────────────────
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5</b> | {now}\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.1</b> | {now}\n"
     msg += f"분석기간: {cutoff[4:6]}/{cutoff[6:]} ~ {base_date[4:6]}/{base_date[6:]} ({len(available_dates)}일)\n"
-    msg += f"ETF {len(top_etfs)}개 AUM 순유입 역추적 → <b>{len(top)}개 종목</b> 선별\n"
+    msg += f"집중형 ETF {len(top_etfs)}개 AUM 순유입 역추적 → <b>{len(top)}개 종목</b> 선별\n"
+    msg += f"(지수형 제외 기준: 구성종목 {MAX_ETF_STOCKS}개 초과)\n"
     msg += "─" * 28 + "\n\n"
 
     if not top:
@@ -539,10 +552,10 @@ def run_analyze():
         for i, r in enumerate(top, 1):
             cap_str   = fmt(r["mktcap"]) if r["mktcap"] > 0 else "N/A"
             disp_str  = f"{r['disp']:+.1f}%" if r["disp"] != 0 else "N/A"
-            disp_icon = " 📉" if r["disp"] < -2.0 else (" 📈" if r["disp"] > 2.0 else "")
+            disp_icon = " 📉" if r["disp"] < DISPARITY_THRESH else (" 📈" if r["disp"] > 2.0 else "")
             msg += (
                 f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
-                f"  ETF유입기여: {fmt(r['inflow'])} | 이격도: {disp_str}{disp_icon}\n"
+                f"  ETF유입기여: {fmt(r['inflow'])} | 이격도({DISPARITY_PERIOD}일): {disp_str}{disp_icon}\n"
                 f"  외국인: {fmt_flow(r['frgn'])} | 기관: {fmt_flow(r['orgn'])}\n"
                 f"  시총: {cap_str} | {r['tags']}\n\n"
             )
@@ -561,7 +574,6 @@ def main():
         log("KIS_APP_KEY/SECRET 없음. 종료.")
         return
 
-    # MODE 결정
     mode = RUN_MODE.upper()
     if not mode:
         mode = "ANALYZE" if is_friday() else "COLLECT"
