@@ -1,8 +1,7 @@
 """
 ETF 수급 기반 종목 스크리너
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
-
-실행: GitHub Actions (매주 월요일 08:00 KST 자동 실행)
+pykrx-openapi (KRX OpenAPI Key 기반) 사용
 """
 
 import os
@@ -10,9 +9,10 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-from pykrx import stock as pykrx
+from pykrx_openapi import stock
 
 # ─── 설정 ────────────────────────────────────────────
+KRX_API_KEY        = os.environ.get("KRX_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "@saladentnews")
 
@@ -54,54 +54,25 @@ def is_equity_etf(name: str) -> bool:
     return True
 
 
-def get_etf_universe() -> list:
+def get_etf_universe(base_date: str) -> list:
     log("ETF 유니버스 수집 중...")
-    tickers = []
-    used_date = None
-
-    # 최근 10 거래일 순서로 시도
-    for days_back in range(1, 15):
-        date = get_recent_business_day(days_back)
-        try:
-            log(f"  날짜 {date} 시도...")
-            try:
-                result = pykrx.get_etf_ticker_list(date)
-            except TypeError:
-                result = pykrx.get_etf_ticker_list()
-            if result and len(result) > 0:
-                tickers = result
-                used_date = date
-                log(f"  → 성공: {date} 기준 {len(tickers)}개 ETF")
-                break
-            else:
-                log(f"  → {date} 결과 없음")
-        except KeyError as e:
-            log(f"  → {date} KeyError({e}) - 다음 날짜 시도")
-            time.sleep(0.3)
-            continue
-        except Exception as e:
-            log(f"  → {date} 오류({type(e).__name__}: {e}) - 다음 날짜 시도")
-            time.sleep(0.3)
-            continue
-
-    # 그래도 실패하면 날짜 없이 한번 더 시도
-    if not tickers:
-        try:
-            log("  날짜 인자 없이 최종 시도...")
-            tickers = pykrx.get_etf_ticker_list()
-            used_date = get_recent_business_day(1)
-            log(f"  → 성공: {len(tickers)}개")
-        except Exception as e:
-            log(f"  → 최종 시도 실패: {e}")
+    try:
+        tickers = stock.get_etf_ticker_list(base_date)
+        if not tickers:
+            log("ETF 리스트 없음")
             return []
+        log(f"  → 전체 ETF {len(tickers)}개")
+    except Exception as e:
+        log(f"  → ETF 리스트 오류: {e}")
+        return []
 
     universe = []
     for t in tickers:
         try:
-            name = pykrx.get_etf_ticker_name(t)
+            name = stock.get_etf_ticker_name(t)
             if is_equity_etf(name):
-                universe.append({"ticker": t, "name": name, "base_date": used_date})
-            time.sleep(0.03)
+                universe.append({"ticker": t, "name": name})
+            time.sleep(0.05)
         except:
             continue
 
@@ -111,7 +82,7 @@ def get_etf_universe() -> list:
 
 def get_etf_net_buy(ticker: str, start: str, end: str) -> float:
     try:
-        df = pykrx.get_market_trading_value_by_date(start, end, ticker)
+        df = stock.get_market_trading_value_by_date(start, end, ticker)
         if df is None or df.empty:
             return 0.0
         cols = df.columns.tolist()
@@ -127,7 +98,7 @@ def get_etf_net_buy(ticker: str, start: str, end: str) -> float:
 
 def get_etf_holdings(ticker: str, date: str) -> dict:
     try:
-        df = pykrx.get_etf_portfolio_deposit_file(ticker, date)
+        df = stock.get_etf_portfolio_deposit_file(ticker, date)
         if df is None or df.empty:
             return {}
         result = {}
@@ -155,21 +126,21 @@ def get_etf_holdings(ticker: str, date: str) -> dict:
 
 def get_stock_metrics(ticker: str, start: str, end: str) -> dict:
     try:
-        cap_df = pykrx.get_market_cap_by_date(start, end, ticker)
+        cap_df = stock.get_market_cap_by_date(start, end, ticker)
         if cap_df is None or cap_df.empty:
             return {}
         market_cap = float(cap_df["시가총액"].iloc[-1])
         if market_cap < MIN_MARKET_CAP:
             return {}
 
-        ohlcv = pykrx.get_market_ohlcv_by_date(start, end, ticker)
+        ohlcv = stock.get_market_ohlcv_by_date(start, end, ticker)
         if ohlcv is None or ohlcv.empty or len(ohlcv) < 5:
             return {}
 
         current = float(ohlcv["종가"].iloc[-1])
         ma5 = float(ohlcv["종가"].tail(5).mean())
         disparity = (current / ma5 - 1) * 100
-        name = pykrx.get_market_ticker_name(ticker)
+        name = stock.get_market_ticker_name(ticker)
 
         return {
             "ticker": ticker,
@@ -222,28 +193,27 @@ def main():
     log("ETF 수급 스크리너 시작")
     log("=" * 50)
 
-    try:
-        import pykrx as pk_module
-        log(f"pykrx 버전: {pk_module.__version__}")
-    except:
-        pass
+    if not KRX_API_KEY:
+        log("KRX_API_KEY 없음. 종료.")
+        return
+
+    log(f"KRX API Key: {KRX_API_KEY[:8]}...")
+    stock.set_api_key(KRX_API_KEY)
 
     start_date, end_date, base_date = get_dates()
     log(f"분석기간: {start_date} ~ {end_date}")
 
     # STEP 1: ETF 유니버스
-    etf_list = get_etf_universe()
+    etf_list = get_etf_universe(base_date)
     if not etf_list:
         log("ETF 리스트 없음. 종료.")
         send_telegram("❌ ETF 스크리너 오류: ETF 리스트 조회 실패")
         return
 
-    base_date = etf_list[0]["base_date"]
-
-    # PDF 컬럼 구조 확인 (디버깅)
+    # PDF 컬럼 확인
     log("첫 ETF PDF 컬럼 확인...")
     try:
-        sample_df = pykrx.get_etf_portfolio_deposit_file(etf_list[0]["ticker"], base_date)
+        sample_df = stock.get_etf_portfolio_deposit_file(etf_list[0]["ticker"], base_date)
         if sample_df is not None and not sample_df.empty:
             log(f"  PDF 컬럼: {sample_df.columns.tolist()}")
             log(f"  PDF 샘플:\n{sample_df.head(2).to_string()}")
