@@ -1,9 +1,16 @@
-name: ETF 수급 스크리너
+name: ETF 수급 스크리너 v5
 
 on:
   schedule:
-    - cron: '30 7 * * 5'  # 매주 금요일 07:30 UTC = 16:30 KST
+    # 월~금 매일 장마감 후 (07:30 UTC = 16:30 KST)
+    - cron: '30 7 * * 1-5'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드 (COLLECT / ANALYZE)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-screener:
@@ -22,6 +29,14 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
+      - name: AUM 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: etf_aum_cache.json
+          key: etf-aum-cache-${{ github.run_id }}
+          restore-keys: |
+            etf-aum-cache-
+
       - name: ETF 스크리너 실행
         env:
           KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
@@ -29,4 +44,12 @@ jobs:
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODE: ${{ github.event.inputs.mode }}
         run: python etf_flow_screener.py
+
+      - name: AUM 캐시 저장
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: etf_aum_cache.json
+          key: etf-aum-cache-${{ github.run_id }}
