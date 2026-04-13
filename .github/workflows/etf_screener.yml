@@ -22,33 +22,9 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
-      - name: pykrx 진단
-        run: |
-          python3 -c "
-          from pykrx import stock
-          from datetime import datetime, timedelta
-          import inspect
-          print('시그니처:', inspect.signature(stock.get_etf_ticker_list))
-          dates = []
-          d = datetime.today()
-          for _ in range(15):
-              d -= timedelta(days=1)
-              if d.weekday() < 5:
-                  dates.append(d.strftime('%Y%m%d'))
-              if len(dates) >= 5:
-                  break
-          print('테스트날짜:', dates)
-          for date in dates:
-              try:
-                  result = stock.get_etf_ticker_list(date)
-                  print(date, '성공', len(result))
-                  break
-              except Exception as e:
-                  print(date, type(e).__name__, str(e))
-          "
-
       - name: ETF 스크리너 실행
         env:
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python etf_flow_screener.py
