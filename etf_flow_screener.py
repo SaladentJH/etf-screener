@@ -54,11 +54,27 @@ def is_equity_etf(name: str) -> bool:
     return True
 
 
+def to_df(result) -> pd.DataFrame:
+    """pykrx_openapi 반환값을 DataFrame으로 변환"""
+    if result is None:
+        return pd.DataFrame()
+    if isinstance(result, pd.DataFrame):
+        return result
+    if isinstance(result, dict):
+        for key in result:
+            val = result[key]
+            if isinstance(val, list) and len(val) > 0:
+                return pd.DataFrame(val)
+        return pd.DataFrame()
+    if isinstance(result, list):
+        return pd.DataFrame(result)
+    return pd.DataFrame()
+
+
 def find_col(df, keywords):
-    """컬럼명 탐색 헬퍼"""
     for c in df.columns:
         for kw in keywords:
-            if kw in c:
+            if kw in str(c):
                 return c
     return None
 
@@ -66,8 +82,9 @@ def find_col(df, keywords):
 def get_etf_universe(client: KRXOpenAPI, base_date: str) -> list:
     log("ETF 유니버스 수집 중...")
     try:
-        df = client.get_etf_daily_trade(bas_dd=base_date)
-        if df is None or df.empty:
+        result = client.get_etf_daily_trade(bas_dd=base_date)
+        df = to_df(result)
+        if df.empty:
             log("  → ETF 데이터 없음")
             return []
         log(f"  → ETF 컬럼: {df.columns.tolist()}")
@@ -76,8 +93,8 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str) -> list:
         log(f"  → ETF 조회 오류: {type(e).__name__}: {e}")
         return []
 
-    code_col = find_col(df, ["종목코드", "단축코드", "ISU_SRT_CD"])
-    name_col = find_col(df, ["종목명", "ISU_NM", "종목 명"])
+    code_col = find_col(df, ["종목코드", "단축코드", "ISU_SRT_CD", "isuSrtCd"])
+    name_col = find_col(df, ["종목명", "ISU_NM", "isuNm"])
 
     if not code_col or not name_col:
         log(f"  → 컬럼 매핑 실패. 전체컬럼: {df.columns.tolist()}")
@@ -98,7 +115,6 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str) -> list:
 
 
 def get_etf_net_buy_period(client: KRXOpenAPI, start: str, end: str) -> dict:
-    """기간 내 ETF별 순매수 집계 (일별 루프)"""
     etf_buys = {}
     start_dt = datetime.strptime(start, "%Y%m%d")
     end_dt = datetime.strptime(end, "%Y%m%d")
@@ -108,18 +124,20 @@ def get_etf_net_buy_period(client: KRXOpenAPI, start: str, end: str) -> dict:
         if current.weekday() < 5:
             date_str = current.strftime("%Y%m%d")
             try:
-                df = client.get_etf_daily_trade(bas_dd=date_str)
-                if df is not None and not df.empty:
-                    code_col = find_col(df, ["종목코드", "단축코드"])
-                    buy_col = find_col(df, ["기관순매수", "기관_순매수", "기관 순매수", "순매수"])
-                    vol_col = find_col(df, ["거래대금"])
+                result = client.get_etf_daily_trade(bas_dd=date_str)
+                df = to_df(result)
+                if not df.empty:
+                    code_col = find_col(df, ["종목코드", "단축코드", "ISU_SRT_CD", "isuSrtCd"])
+                    buy_col  = find_col(df, ["기관순매수", "기관_순매수", "기관 순매수", "InstNetBuyVol", "instNetBuyVol"])
+                    val_col  = find_col(df, ["거래대금", "TDD_TRDVAL", "tddTrdval"])
 
                     if code_col:
-                        use_col = buy_col or vol_col
+                        use_col = buy_col or val_col
                         for _, row in df.iterrows():
                             try:
                                 ticker = str(row[code_col]).strip().zfill(6)
-                                val = float(str(row[use_col]).replace(",", "") or 0) if use_col else 0
+                                raw = str(row[use_col]).replace(",", "").replace("-", "0") if use_col else "0"
+                                val = float(raw or 0)
                                 if val > 0:
                                     etf_buys[ticker] = etf_buys.get(ticker, 0) + val
                             except:
@@ -133,29 +151,29 @@ def get_etf_net_buy_period(client: KRXOpenAPI, start: str, end: str) -> dict:
 
 
 def get_stock_info(client: KRXOpenAPI, ticker: str, end_date: str) -> dict:
-    """종목 기본정보"""
-    for get_fn, market in [(client.get_stock_daily_trade, "유가"), (client.get_kosdaq_stock_daily_trade, "코스닥")]:
+    for get_fn in [client.get_stock_daily_trade, client.get_kosdaq_stock_daily_trade]:
         try:
-            df = get_fn(bas_dd=end_date)
-            if df is None or df.empty:
+            result = get_fn(bas_dd=end_date)
+            df = to_df(result)
+            if df.empty:
                 continue
-            code_col = find_col(df, ["종목코드", "단축코드"])
+            code_col = find_col(df, ["종목코드", "단축코드", "ISU_SRT_CD", "isuSrtCd"])
             if not code_col:
                 continue
             row = df[df[code_col].astype(str).str.zfill(6) == ticker]
             if row.empty:
                 continue
 
-            cap_col = find_col(df, ["시가총액"])
-            price_col = find_col(df, ["종가", "현재가"])
-            name_col = find_col(df, ["종목명", "ISU_NM"])
+            cap_col   = find_col(df, ["시가총액", "MKTCAP", "mktcap"])
+            price_col = find_col(df, ["종가", "현재가", "TDD_CLSPRC", "tddClsprc"])
+            name_col  = find_col(df, ["종목명", "ISU_NM", "isuNm"])
 
             market_cap = float(str(row[cap_col].iloc[0]).replace(",", "") or 0) if cap_col else 0
-            price = float(str(row[price_col].iloc[0]).replace(",", "") or 0) if price_col else 0
-            name = str(row[name_col].iloc[0]).strip() if name_col else ticker
+            price      = float(str(row[price_col].iloc[0]).replace(",", "") or 0) if price_col else 0
+            name       = str(row[name_col].iloc[0]).strip() if name_col else ticker
 
             if market_cap >= MIN_MARKET_CAP and price > 0:
-                return {"ticker": ticker, "name": name, "market_cap": market_cap, "price": price, "market": market}
+                return {"ticker": ticker, "name": name, "market_cap": market_cap, "price": price}
         except:
             continue
     return {}
@@ -207,13 +225,13 @@ def main():
         return
 
     etf_tickers = {e["ticker"]: e["name"] for e in etf_list}
+    log(f"유니버스: {len(etf_tickers)}개 ETF")
 
     # STEP 2: 기간 순매수 집계
-    log(f"\nETF 기간 순매수 집계 중...")
+    log(f"\nETF 기간 순매수 집계 중... ({start_date}~{end_date})")
     etf_buys = get_etf_net_buy_period(client, start_date, end_date)
     log(f"  → 집계 ETF 수: {len(etf_buys)}개")
 
-    # 유니버스 필터
     filtered = {k: v for k, v in etf_buys.items() if k in etf_tickers and v >= MIN_ETF_INFLOW}
     log(f"  → 10억 이상 유입: {len(filtered)}개")
 
@@ -226,12 +244,11 @@ def main():
     results = []
 
     for ticker, inflow in filtered.items():
-        info = get_stock_info(client, ticker, end_date)
-        name = info.get("name") or etf_tickers.get(ticker, ticker)
+        info       = get_stock_info(client, ticker, end_date)
+        name       = info.get("name") or etf_tickers.get(ticker, ticker)
         market_cap = info.get("market_cap", 0)
-
-        conds = "🎯ETF수급"
-        if market_cap > 0 and market_cap < 1_000_000_000_000:
+        conds      = "🎯ETF수급"
+        if 0 < market_cap < 1_000_000_000_000:
             conds += " 🔹소형"
 
         results.append({
