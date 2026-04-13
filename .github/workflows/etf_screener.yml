@@ -3,7 +3,7 @@ name: ETF 수급 스크리너 v5
 on:
   schedule:
     # 월~금 매일 장마감 후 (07:30 UTC = 16:30 KST)
-    - cron: '30 7 * * 1-5'
+    - cron: '0 22 * * 1-5'   # 익일 07:00 KST
   workflow_dispatch:
     inputs:
       mode:
