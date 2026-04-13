@@ -2,7 +2,7 @@ name: ETF 수급 스크리너
 
 on:
   schedule:
-    - cron: '0 23 * * 0'  # 매주 일요일 23:00 UTC = 월요일 08:00 KST
+    - cron: '30 7 * * 1'  # 매주 월요일 07:30 UTC = 16:30 KST (당일 마감 후)
   workflow_dispatch:
 
 jobs:
