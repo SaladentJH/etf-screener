@@ -16,9 +16,9 @@ KRX_API_KEY        = os.environ.get("KRX_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "@saladentnews")
 
-MIN_MARKET_CAP  = 200_000_000_000
-MIN_ETF_INFLOW  = 10_000_000_000
+MIN_ETF_INFLOW  = 10_000_000_000   # 최소 거래대금 10억
 TOP_N           = 20
+LOOKBACK_DAYS   = 7                # 1주일 (영업일 5일)
 
 EXCLUDE_KEYWORDS = [
     "레버리지", "인버스", "2X", "3X", "-1X", "곱버스",
@@ -43,7 +43,7 @@ def get_recent_business_day(days_back=1):
 def get_dates():
     base = get_recent_business_day(1)
     base_dt = datetime.strptime(base, "%Y%m%d")
-    start_dt = base_dt - timedelta(days=20)
+    start_dt = base_dt - timedelta(days=LOOKBACK_DAYS)
     return start_dt.strftime("%Y%m%d"), base, base
 
 
@@ -81,98 +81,80 @@ def find_col(df, keywords):
     return None
 
 
-def get_etf_universe(client: KRXOpenAPI, base_date: str) -> list:
+def get_etf_data(client: KRXOpenAPI, base_date: str) -> dict:
+    """ETF 유니버스 + 시총을 한번에 수집"""
     log("ETF 유니버스 수집 중...")
     try:
         result = client.get_etf_daily_trade(bas_dd=base_date)
         df = to_df(result)
         if df.empty:
             log("  → ETF 데이터 없음")
-            return []
+            return {}
         log(f"  → ETF 컬럼: {df.columns.tolist()}")
     except Exception as e:
         log(f"  → ETF 조회 오류: {type(e).__name__}: {e}")
-        return []
+        return {}
 
     code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD", "종목코드", "단축코드"])
     name_col = find_col(df, ["ISU_NM", "종목명"])
+    cap_col  = find_col(df, ["MKTCAP", "시가총액"])
 
     if not code_col or not name_col:
-        log(f"  → 컬럼 매핑 실패. 전체컬럼: {df.columns.tolist()}")
-        return []
+        log(f"  → 컬럼 매핑 실패: {df.columns.tolist()}")
+        return {}
 
-    log(f"  → code_col={code_col}, name_col={name_col}")
-    universe = []
+    etf_info = {}
     for _, row in df.iterrows():
         try:
             ticker = str(row[code_col]).strip().zfill(6)
-            name = str(row[name_col]).strip()
+            name   = str(row[name_col]).strip()
+            mktcap = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
             if len(ticker) == 6 and ticker.isdigit() and is_equity_etf(name):
-                universe.append({"ticker": ticker, "name": name})
+                etf_info[ticker] = {"name": name, "mktcap": mktcap}
         except:
             continue
 
-    log(f"  → 국내 주식형 ETF {len(universe)}개 선별")
-    return universe
+    log(f"  → 국내 주식형 ETF {len(etf_info)}개 선별")
+    return etf_info
 
 
-def get_etf_net_buy_period(client: KRXOpenAPI, start: str, end: str) -> dict:
+def get_etf_buys(client: KRXOpenAPI, start: str, end: str, etf_tickers: set) -> dict:
+    """기간 내 ETF별 거래대금 집계"""
     etf_buys = {}
     start_dt = datetime.strptime(start, "%Y%m%d")
-    end_dt = datetime.strptime(end, "%Y%m%d")
-    current = start_dt
+    end_dt   = datetime.strptime(end, "%Y%m%d")
+    current  = start_dt
+    day_count = 0
 
     while current <= end_dt:
         if current.weekday() < 5:
             date_str = current.strftime("%Y%m%d")
+            day_count += 1
             try:
                 result = client.get_etf_daily_trade(bas_dd=date_str)
                 df = to_df(result)
                 if not df.empty:
-                    code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD", "종목코드", "단축코드"])
-                    val_col  = find_col(df, ["ACC_TRDVAL", "거래대금", "TDD_TRDVAL"])
+                    code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
+                    val_col  = find_col(df, ["ACC_TRDVAL", "거래대금"])
                     if code_col and val_col:
                         for _, row in df.iterrows():
                             try:
                                 ticker = str(row[code_col]).strip().zfill(6)
+                                if ticker not in etf_tickers:
+                                    continue
                                 raw = str(row[val_col]).replace(",", "").replace("-", "0")
                                 val = float(raw or 0)
                                 if val > 0:
                                     etf_buys[ticker] = etf_buys.get(ticker, 0) + val
                             except:
                                 continue
+                log(f"  {date_str} 처리완료 ({day_count}일차)")
                 time.sleep(0.2)
             except Exception as e:
-                log(f"  날짜 {date_str} 오류: {e}")
+                log(f"  {date_str} 오류: {e}")
         current += timedelta(days=1)
 
     return etf_buys
-
-
-def get_stock_info(client: KRXOpenAPI, ticker: str, end_date: str) -> dict:
-    for get_fn in [client.get_stock_daily_trade, client.get_kosdaq_stock_daily_trade]:
-        try:
-            result = get_fn(bas_dd=end_date)
-            df = to_df(result)
-            if df.empty:
-                continue
-            code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD", "종목코드", "단축코드"])
-            if not code_col:
-                continue
-            row = df[df[code_col].astype(str).str.zfill(6) == ticker]
-            if row.empty:
-                continue
-            cap_col   = find_col(df, ["MKTCAP", "시가총액"])
-            price_col = find_col(df, ["TDD_CLSPRC", "종가", "현재가"])
-            name_col  = find_col(df, ["ISU_NM", "종목명"])
-            market_cap = float(str(row[cap_col].iloc[0]).replace(",", "") or 0) if cap_col else 0
-            price      = float(str(row[price_col].iloc[0]).replace(",", "") or 0) if price_col else 0
-            name       = str(row[name_col].iloc[0]).strip() if name_col else ticker
-            if market_cap >= MIN_MARKET_CAP and price > 0:
-                return {"ticker": ticker, "name": name, "market_cap": market_cap, "price": price}
-        except:
-            continue
-    return {}
 
 
 def fmt(n: float) -> str:
@@ -208,61 +190,61 @@ def main():
         return
 
     log(f"KRX API Key: {KRX_API_KEY[:8]}...")
-    client = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1, debug=True)
+    client = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
 
     start_date, end_date, base_date = get_dates()
-    log(f"분석기간: {start_date} ~ {end_date}")
+    log(f"분석기간: {start_date} ~ {end_date} ({LOOKBACK_DAYS}일)")
 
-    etf_list = get_etf_universe(client, base_date)
-    if not etf_list:
+    # STEP 1: ETF 유니버스 + 시총 수집
+    etf_info = get_etf_data(client, base_date)
+    if not etf_info:
         log("ETF 리스트 없음. 종료.")
         send_telegram("❌ ETF 스크리너: ETF 리스트 조회 실패")
         return
 
-    etf_tickers = {e["ticker"]: e["name"] for e in etf_list}
-    log(f"유니버스: {len(etf_tickers)}개 ETF")
+    log(f"유니버스: {len(etf_info)}개 ETF")
 
-    log(f"\nETF 기간 거래대금 집계 중...")
-    etf_buys = get_etf_net_buy_period(client, start_date, end_date)
-    log(f"  → 집계 ETF 수: {len(etf_buys)}개")
+    # STEP 2: 기간 거래대금 집계
+    log(f"\nETF 거래대금 집계 중...")
+    etf_buys = get_etf_buys(client, start_date, end_date, set(etf_info.keys()))
+    log(f"  → 집계: {len(etf_buys)}개")
 
-    filtered = {k: v for k, v in etf_buys.items() if k in etf_tickers and v >= MIN_ETF_INFLOW}
+    # STEP 3: 필터링
+    filtered = {k: v for k, v in etf_buys.items() if v >= MIN_ETF_INFLOW}
     log(f"  → 10억 이상: {len(filtered)}개")
 
     if not filtered:
         log("필터 통과 없음. 상위 20개로 완화.")
-        filtered = {k: v for k, v in sorted(etf_buys.items(), key=lambda x: x[1], reverse=True)[:20] if k in etf_tickers}
+        filtered = dict(sorted(etf_buys.items(), key=lambda x: x[1], reverse=True)[:20])
 
-    log(f"\n종목 정보 수집 중...")
+    # STEP 4: 결과 조합
     results = []
     for ticker, inflow in filtered.items():
-        info       = get_stock_info(client, ticker, end_date)
-        name       = info.get("name") or etf_tickers.get(ticker, ticker)
-        market_cap = info.get("market_cap", 0)
-        conds      = "🎯ETF수급"
-        if 0 < market_cap < 1_000_000_000_000:
+        info   = etf_info.get(ticker, {})
+        name   = info.get("name", ticker)
+        mktcap = info.get("mktcap", 0)
+        conds  = "🎯ETF수급"
+        if 0 < mktcap < 1_000_000_000_000:
             conds += " 🔹소형"
         results.append({"ticker": ticker, "name": name, "inflow": inflow,
-                        "market_cap": market_cap, "score": inflow, "conds": conds})
-        time.sleep(0.05)
+                        "mktcap": mktcap, "score": inflow, "conds": conds})
 
     results.sort(key=lambda x: x["score"], reverse=True)
     top = results[:TOP_N]
     log(f"\n  → 최종 선별: {len(top)}개")
 
+    # STEP 5: 텔레그램 발송
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
     msg = f"📊 <b>ETF 수급 스크리너</b> | {now}\n"
-    msg += f"분석기간: {start_date[4:6]}/{start_date[6:]} ~ {end_date[4:6]}/{end_date[6:]}\n"
+    msg += f"분석기간: {start_date[4:6]}/{start_date[6:]} ~ {end_date[4:6]}/{end_date[6:]} (1주)\n"
     msg += f"선별: <b>{len(top)}개 ETF</b>\n"
     msg += "─" * 28 + "\n\n"
-    if not top:
-        msg += "조건 충족 종목이 없습니다.\n"
-    else:
-        for i, r in enumerate(top, 1):
-            cap_str = fmt(r["market_cap"]) if r["market_cap"] > 0 else "N/A"
-            msg += (f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
-                    f"  ETF거래대금: {fmt(r['inflow'])} | 시총: {cap_str}\n"
-                    f"  {r['conds']}\n\n")
+
+    for i, r in enumerate(top, 1):
+        cap_str = fmt(r["mktcap"]) if r["mktcap"] > 0 else "N/A"
+        msg += (f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
+                f"  거래대금: {fmt(r['inflow'])} | 순자산: {cap_str}\n"
+                f"  {r['conds']}\n\n")
 
     send_telegram(msg)
     log("\n완료!")
