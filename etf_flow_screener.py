@@ -5,12 +5,6 @@ ETF 수급 기반 종목 스크리너 v4
 추가 데이터:
   - 외국인/기관 당일 순매수 (KIS inquire_investor)
   - 5일 이격도 (KIS inquire_daily_price 기반 직접 계산)
-
-출력 형식:
-  1. 삼성전자 (005930)
-     ETF유입기여: 7.5조 | 이격도: -3.2% 📉
-     외국인: +2,450억 | 기관: +1,230억
-     시총: 1,219조 | 🎯ETF수급
 """
 
 import os
@@ -47,7 +41,7 @@ EXCLUDE_KEYWORDS = [
 
 
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def get_recent_business_day(days_back=1):
@@ -148,7 +142,10 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 
 # ─── KIS 투자자별 순매수 ──────────────────────────────
 
+_investor_debug_done = False  # 첫 종목만 디버그
+
 def get_investor_net_buy(ticker: str, token: str) -> dict:
+    global _investor_debug_done
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor",
         "FHKST01010900",
@@ -156,8 +153,21 @@ def get_investor_net_buy(ticker: str, token: str) -> dict:
         token,
     )
     output = data.get("output", [])
+
+    # 첫 번째 종목만 응답 구조 출력
+    if not _investor_debug_done:
+        _investor_debug_done = True
+        log(f"  [INVESTOR DEBUG {ticker}] rt_cd={data.get('rt_cd')} msg1={data.get('msg1','')[:60]}")
+        log(f"  [INVESTOR DEBUG {ticker}] output 길이={len(output)}")
+        if output:
+            log(f"  [INVESTOR DEBUG {ticker}] output[0] keys={list(output[0].keys())}")
+            log(f"  [INVESTOR DEBUG {ticker}] output[0]={output[0]}")
+        else:
+            log(f"  [INVESTOR DEBUG {ticker}] output 비어있음. 전체 응답={data}")
+
     if not output:
         return {"frgn": 0, "orgn": 0}
+
     row = output[0]
     try:
         frgn = float(str(row.get("frgn_ntby_tr_pbmn", 0) or 0))
