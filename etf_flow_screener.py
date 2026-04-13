@@ -30,7 +30,6 @@ TOP_ETF_N        = 30              # 편입종목 역추적할 상위 ETF 수
 TOP_N            = 20              # 최종 종목 선별 수
 LOOKBACK_DAYS    = 7               # 분석 기간 (달력 기준)
 
-# ETF 제외 키워드
 EXCLUDE_KEYWORDS = [
     "레버리지", "인버스", "2X", "3X", "-1X", "곱버스",
     "해외", "미국", "중국", "일본", "인도", "베트남", "나스닥", "S&P",
@@ -111,7 +110,7 @@ def get_kis_token() -> str:
         return ""
 
 
-def get_etf_components_kis(etf_ticker: str, token: str) -> list:
+def get_etf_components_kis(etf_ticker: str, token: str, debug: bool = False) -> list:
     """KIS - ETF 구성종목시세 (TR: FHKST121600C0)"""
     url = f"{KIS_BASE_URL}/uapi/etfetn/v1/quotations/inquire-component-stock-price"
     headers = {
@@ -129,6 +128,18 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
     try:
         r = requests.get(url, headers=headers, params=params, timeout=10)
         data = r.json()
+
+        if debug:
+            log(f"  [KIS DEBUG {etf_ticker}] HTTP {r.status_code}")
+            log(f"  [KIS DEBUG {etf_ticker}] rt_cd={data.get('rt_cd')} msg1={data.get('msg1', '')[:80]}")
+            log(f"  [KIS DEBUG {etf_ticker}] 응답 keys={list(data.keys())}")
+            output2_debug = data.get("output2", [])
+            log(f"  [KIS DEBUG {etf_ticker}] output2 len={len(output2_debug)}")
+            if output2_debug:
+                log(f"  [KIS DEBUG {etf_ticker}] output2[0]={output2_debug[0]}")
+            else:
+                log(f"  [KIS DEBUG {etf_ticker}] output1={data.get('output1', {})}")
+
         output2 = data.get("output2", [])
         holdings = []
         for row in output2:
@@ -331,13 +342,14 @@ def main():
         return
     log("  → 토큰 발급 성공")
 
-    # STEP 4: 편입종목 역추적
+    # STEP 4: 편입종목 역추적 (첫 2개 디버그)
     log("\n편입종목 역추적 중...")
     stock_inflow = {}
     pdf_ok = 0
 
-    for etf_ticker, etf_vol in top_etfs:
-        holdings = get_etf_components_kis(etf_ticker, kis_token)
+    for i, (etf_ticker, etf_vol) in enumerate(top_etfs):
+        debug = (i < 2)  # 상위 2개 ETF만 상세 로그
+        holdings = get_etf_components_kis(etf_ticker, kis_token, debug=debug)
         if not holdings:
             time.sleep(0.2)
             continue
