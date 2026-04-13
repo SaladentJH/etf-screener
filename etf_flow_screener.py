@@ -31,7 +31,7 @@ KIS_BASE_URL       = "https://openapi.koreainvestment.com:9443"
 
 MIN_STOCK_INFLOW = 3_000_000_000
 TOP_ETF_N        = 30
-TOP_N            = 20
+TOP_N            = 30   # 최종 발송 종목 수
 CANDIDATE_N      = 30   # KIS 조회 후보 종목 수
 LOOKBACK_DAYS    = 7
 
@@ -350,14 +350,12 @@ def main():
     start_date, end_date, base_date = get_dates()
     log(f"분석기간: {start_date} ~ {end_date}")
 
-    # STEP 1: ETF 유니버스
     etf_info = get_etf_universe(krx, base_date)
     if not etf_info:
         send_telegram("❌ ETF 스크리너: ETF 조회 실패")
         return
     log(f"유니버스: {len(etf_info)}개 ETF")
 
-    # STEP 2: 기간 거래대금
     log("\nETF 거래대금 집계 중...")
     etf_buys = get_etf_buys(krx, start_date, end_date, set(etf_info.keys()))
     log(f"  → {len(etf_buys)}개 집계")
@@ -365,7 +363,6 @@ def main():
     top_etfs = sorted(etf_buys.items(), key=lambda x: x[1], reverse=True)[:TOP_ETF_N]
     log(f"  → 상위 {len(top_etfs)}개 ETF 편입종목 역추적")
 
-    # STEP 3: KIS 토큰
     log("\nKIS 토큰 발급 중...")
     kis_token = get_kis_token()
     if not kis_token:
@@ -374,7 +371,6 @@ def main():
         return
     log("  → 토큰 발급 성공")
 
-    # STEP 4: 편입종목 역추적
     log("\n편입종목 역추적 중...")
     stock_inflow = {}
     pdf_ok = 0
@@ -399,11 +395,9 @@ def main():
         _fallback(etf_info, etf_buys, start_date, end_date)
         return
 
-    # STEP 5: 종목 정보 (KRX)
     log("\n종목 정보 수집 중...")
     stock_info = get_stock_info_bulk(krx, base_date)
 
-    # STEP 6: 필터 + 1차 정렬
     candidates = []
     for ticker, inflow in stock_inflow.items():
         if inflow < MIN_STOCK_INFLOW:
@@ -416,20 +410,17 @@ def main():
         candidates.append({"ticker": ticker, "name": name, "inflow": inflow, "mktcap": mktcap})
 
     candidates.sort(key=lambda x: x["inflow"], reverse=True)
-    top_candidates = candidates[:CANDIDATE_N]  # 상위 30개에 대해 KIS 조회
-    log(f"  → 후보 종목: {len(top_candidates)}개 (KIS 조회 예정)")
+    top_candidates = candidates[:CANDIDATE_N]
+    log(f"  → 후보 종목: {len(top_candidates)}개")
 
-    # STEP 7: KIS 투자자 순매수 + 이격도 수집
     log("\n투자자 순매수 + 이격도 수집 중...")
     results = []
 
     for c in top_candidates:
         ticker = c["ticker"]
-
         investor = get_investor_net_buy(ticker, kis_token)
         frgn = investor["frgn"]
         orgn = investor["orgn"]
-
         disp = get_disparity(ticker, kis_token, n=5)
 
         tags = ["🎯ETF수급"]
@@ -442,20 +433,13 @@ def main():
         if orgn > 0:
             tags.append("🏦기관↑")
 
-        results.append({
-            **c,
-            "frgn": frgn,
-            "orgn": orgn,
-            "disp": disp,
-            "tags": " ".join(tags),
-        })
+        results.append({**c, "frgn": frgn, "orgn": orgn, "disp": disp, "tags": " ".join(tags)})
         time.sleep(0.15)
 
     results.sort(key=lambda x: x["inflow"], reverse=True)
     top = results[:TOP_N]
     log(f"\n  → 최종 선별: {len(top)}개")
 
-    # STEP 8: 텔레그램 발송
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
     msg = f"📊 <b>ETF 수급 종목 스크리너</b> | {now}\n"
     msg += f"분석기간: {start_date[4:6]}/{start_date[6:]} ~ {end_date[4:6]}/{end_date[6:]}\n"
@@ -469,7 +453,6 @@ def main():
             cap_str   = fmt(r["mktcap"]) if r["mktcap"] > 0 else "N/A"
             disp_str  = f"{r['disp']:+.1f}%" if r["disp"] != 0 else "N/A"
             disp_icon = " 📉" if r["disp"] < -2.0 else (" 📈" if r["disp"] > 2.0 else "")
-
             msg += (
                 f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
                 f"  ETF유입기여: {fmt(r['inflow'])} | 이격도: {disp_str}{disp_icon}\n"
