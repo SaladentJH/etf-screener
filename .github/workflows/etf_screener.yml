@@ -2,7 +2,7 @@ name: ETF 수급 스크리너
 
 on:
   schedule:
-    - cron: '0 23 * * 0'
+    - cron: '0 23 * * 0'  # 매주 일요일 23:00 UTC = 월요일 08:00 KST
   workflow_dispatch:
 
 jobs:
@@ -25,6 +25,8 @@ jobs:
       - name: ETF 스크리너 실행
         env:
           KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python etf_flow_screener.py
