@@ -1,15 +1,13 @@
 """
-ETF 수급 기반 종목 스크리너 v5.6
+ETF 수급 기반 종목 스크리너 v5.7
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경 (v5.5 → v5.6):
-  - 수급강도 N/A 수정:
-    acml_tr_pbmn(누적거래대금) 장마감 후 0 리셋 이슈
-    → stck_clpr(종가) × acml_vol(누적거래량)으로 거래대금 직접 계산
-  - 외인/기관 당일 0값 제거:
-    장 열리기 전 0값 행 필터링 (frgn==0 and orgn==0 동시인 행 제외)
-  - 텔레그램 가독성 개선:
-    종목별 구분선 추가, 헤더 정리
+변경 (v5.6 → v5.7):
+  - KRX get_etf_universe() 중복 호출 제거
+    v5.6: COLLECT + ANALYZE 각각 호출 (총 2회) → ANALYZE에서 타임아웃
+    v5.7: main()에서 1회 호출 후 COLLECT/ANALYZE 모두 재사용
+  - KRX API 재시도 로직 추가 (타임아웃 시 5초 대기 후 1회 재시도)
+  - get_stock_info_bulk() 도 main()에서 1회 호출로 통합
 """
 
 import os
@@ -31,18 +29,17 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW  = 3_000_000_000    # 종목 최소 ETF 유입 기여액 (3억)
-MIN_LIQUIDITY_20D = 20_000_000_000   # 20일 평균거래대금 최소 기준 (200억)
-TOP_ETF_N         = 30               # 순유입 상위 ETF 수
-CANDIDATE_N       = 30               # KIS 조회 후보 종목 수
-TOP_N             = 30               # 최종 발송 종목 수
-LOOKBACK_DAYS     = 7                # 캐시 조회 기간 (캘린더 기준)
-DISPARITY_PERIOD  = 20               # 이격도 이동평균 기간 (20일)
-DISPARITY_THRESH  = -2.0             # 이격도 단기하락 기준 (%)
-MAX_ETF_STOCKS    = 30               # 집중형 ETF 기준: 구성종목 수 30개 이하
-FLOW_INTENSITY_HI = 3.0              # 수급강도 고강도 기준 (3x 이상 → 🔥)
+MIN_STOCK_INFLOW  = 3_000_000_000
+MIN_LIQUIDITY_20D = 20_000_000_000
+TOP_ETF_N         = 30
+CANDIDATE_N       = 30
+TOP_N             = 30
+LOOKBACK_DAYS     = 7
+DISPARITY_PERIOD  = 20
+DISPARITY_THRESH  = -2.0
+MAX_ETF_STOCKS    = 30
+FLOW_INTENSITY_HI = 3.0
 
-# 요일별 외인/기관 표시 영업일 수 (월=1 ~ 금=5)
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
 EXCLUDE_KEYWORDS = [
@@ -53,7 +50,6 @@ EXCLUDE_KEYWORDS = [
     "머니마켓", "MMF", "단기", "CD금리", "KOFR", "SOFR",
     "부동산", "리츠", "REIT",
 ]
-# ──────────────────────────────────────────────────────
 
 
 def log(msg):
@@ -61,10 +57,7 @@ def log(msg):
 
 
 def is_valid_etf(name: str) -> bool:
-    for kw in EXCLUDE_KEYWORDS:
-        if kw in name:
-            return False
-    return True
+    return all(kw not in name for kw in EXCLUDE_KEYWORDS)
 
 
 def get_recent_business_day(days_back: int = 1) -> str:
@@ -79,33 +72,27 @@ def get_investor_days() -> int:
 
 
 def to_df(result) -> pd.DataFrame:
-    if result is None:
-        return pd.DataFrame()
-    if isinstance(result, pd.DataFrame):
-        return result
+    if result is None: return pd.DataFrame()
+    if isinstance(result, pd.DataFrame): return result
     if isinstance(result, dict):
         for val in result.values():
             if isinstance(val, list) and val:
                 return pd.DataFrame(val)
         return pd.DataFrame()
-    if isinstance(result, list):
-        return pd.DataFrame(result)
+    if isinstance(result, list): return pd.DataFrame(result)
     return pd.DataFrame()
 
 
 def find_col(df, keywords):
     for kw in keywords:
-        if kw in df.columns:
-            return kw
+        if kw in df.columns: return kw
     for c in df.columns:
         for kw in keywords:
-            if kw in str(c):
-                return c
+            if kw in str(c): return c
     return None
 
 
-# ─── 캐시 구조 ───────────────────────────────────────
-# {날짜: {ticker: {"lstn_stcn": float, "nav": float, "cnt": int}}}
+# ─── 캐시 ────────────────────────────────────────────
 
 def load_aum_cache() -> dict:
     if os.path.exists(AUM_CACHE_FILE):
@@ -127,10 +114,11 @@ def prune_cache(cache: dict, keep_days: int = 14) -> dict:
 # ─── KIS 공통 ────────────────────────────────────────
 
 def get_kis_token() -> str:
-    url = f"{KIS_BASE_URL}/oauth2/tokenP"
-    body = {"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET}
     try:
-        r = requests.post(url, json=body, timeout=10)
+        r = requests.post(f"{KIS_BASE_URL}/oauth2/tokenP",
+                          json={"grant_type": "client_credentials",
+                                "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET},
+                          timeout=10)
         return r.json().get("access_token", "")
     except Exception as e:
         log(f"  KIS 토큰 오류: {e}")
@@ -153,170 +141,24 @@ def kis_get(path: str, tr_id: str, params: dict, token: str) -> dict:
         return {}
 
 
-# ─── KIS ETF 데이터 수집 ──────────────────────────────
+# ─── KRX API (재시도 포함, main에서 1회만 호출) ──────────
 
-def get_etf_data_today(etf_tickers: list, token: str) -> dict:
-    """
-    FHPST02400000 (ETF/ETN 현재가)
-    lstn_stcn: 상장주수, nav: NAV(원), etf_cnfg_issu_cnt: 구성종목수
-    반환: {ticker: {"lstn_stcn": float, "nav": float, "cnt": int}}
-    """
-    result = {}
-    for i, ticker in enumerate(etf_tickers):
-        data = kis_get(
-            "/uapi/etfetn/v1/quotations/inquire-price",
-            "FHPST02400000",
-            {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker},
-            token,
-        )
-        output = data.get("output", {})
-        try:
-            lstn_stcn = float(str(output.get("lstn_stcn", "0") or "0").replace(",", ""))
-            nav_raw   = float(str(output.get("nav", "0") or "0").replace(",", ""))
-            cnt       = int(float(str(output.get("etf_cnfg_issu_cnt", "0") or "0").replace(",", "")))
-            if lstn_stcn > 0 and nav_raw > 0:
-                result[ticker] = {"lstn_stcn": lstn_stcn, "nav": nav_raw, "cnt": cnt}
-        except:
-            pass
-        if (i + 1) % 5 == 0:
-            time.sleep(1.1)
-
-    log(f"  → ETF 데이터 수집: {len(result)}개")
-    return result
-
-
-# ─── KIS ETF 구성종목 ─────────────────────────────────
-
-def get_etf_components_kis(etf_ticker: str, token: str) -> list:
-    data = kis_get(
-        "/uapi/etfetn/v1/quotations/inquire-component-stock-price",
-        "FHKST121600C0",
-        {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": etf_ticker, "FID_COND_SCR_DIV_CODE": "11216"},
-        token,
-    )
-    holdings = []
-    for row in data.get("output2", []):
-        code   = str(row.get("stck_shrn_iscd", "")).strip().zfill(6)
-        name   = str(row.get("hts_kor_isnm", "")).strip()
-        weight = float(str(row.get("etf_cnfg_issu_rlim", 0) or 0))
-        if len(code) == 6 and code.isdigit() and weight > 0:
-            holdings.append({"ticker": code, "name": name, "weight": weight})
-    return holdings
-
-
-# ─── KIS 투자자별 순매수 - 일자별 ────────────────────────
-
-def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
-    """
-    FHKST01010900 - output[0]=당일, output[1]=전일, ...
-    당일 0값 제거: frgn==0 and orgn==0 동시인 행은 장 미개장으로 판단 → 필터링
-    반환: {daily: [{date, frgn, orgn}], frgn_sum, orgn_sum}
-    단위: 백만원 × 1,000,000 = 원
-    """
-    data = kis_get(
-        "/uapi/domestic-stock/v1/quotations/inquire-investor",
-        "FHKST01010900",
-        {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker},
-        token,
-    )
-    output   = data.get("output", [])
-    daily    = []
-    frgn_sum = 0.0
-    orgn_sum = 0.0
-
-    for row in output[:days]:
-        try:
-            date_raw = str(row.get("stck_bsop_date", ""))
-            date_str = f"{date_raw[4:6]}/{date_raw[6:8]}" if len(date_raw) == 8 else "??"
-            frgn = float(str(row.get("frgn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
-            orgn = float(str(row.get("orgn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
-            # 외인/기관 모두 0이면 장 미개장 데이터 → 제외
-            if frgn == 0 and orgn == 0:
-                continue
-            daily.append({"date": date_str, "frgn": frgn, "orgn": orgn})
-            frgn_sum += frgn
-            orgn_sum += orgn
-        except:
-            continue
-
-    return {"daily": daily, "frgn_sum": frgn_sum, "orgn_sum": orgn_sum}
-
-
-# ─── KIS 이격도 + 거래대금 (단일 API 호출) ───────────────
-
-def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> dict:
-    """
-    FHKST01010400 - 일별 주가
-    이격도(n일) + 5일/20일 평균거래대금 단일 호출 계산
-
-    거래대금 계산:
-      acml_tr_pbmn 장마감 후 0 리셋 이슈 있음
-      → stck_clpr(종가) × acml_vol(누적거래량)으로 직접 계산
-
-    반환:
-      disparity  : float  n일 이격도 (%)
-      vol_5d_avg : float  5일 평균거래대금 (원)  → 수급강도 분모
-      vol_20d_avg: float  20일 평균거래대금 (원) → 유동성 필터
-    """
-    data = kis_get(
-        "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-        "FHKST01010400",
-        {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
-         "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"},
-        token,
-    )
-    output = data.get("output", [])
-
-    disparity   = 0.0
-    vol_5d_avg  = 0.0
-    vol_20d_avg = 0.0
-
-    if not output:
-        return {"disparity": disparity, "vol_5d_avg": vol_5d_avg, "vol_20d_avg": vol_20d_avg}
-
-    try:
-        # n일 이격도
-        if len(output) >= n + 1:
-            prices = [float(str(row.get("stck_clpr", 0) or 0)) for row in output[:n + 1]]
-            if not any(p == 0 for p in prices):
-                disparity = (prices[0] / (sum(prices[:n]) / n) - 1) * 100
-
-        # 거래대금 = 종가 × 누적거래량 (acml_tr_pbmn 장마감 후 0 이슈 회피)
-        def calc_vol(row):
-            try:
-                price = float(str(row.get("stck_clpr", 0) or 0))
-                vol   = float(str(row.get("acml_vol", 0) or 0))
-                return price * vol
-            except:
-                return 0.0
-
-        # 5일 평균거래대금
-        vols_5 = [calc_vol(r) for r in output[:5] if calc_vol(r) > 0]
-        if vols_5:
-            vol_5d_avg = sum(vols_5) / len(vols_5)
-
-        # 20일 평균거래대금
-        vols_20 = [calc_vol(r) for r in output[:20] if calc_vol(r) > 0]
-        if vols_20:
-            vol_20d_avg = sum(vols_20) / len(vols_20)
-
-    except:
-        pass
-
-    return {"disparity": disparity, "vol_5d_avg": vol_5d_avg, "vol_20d_avg": vol_20d_avg}
-
-
-# ─── KRX API ─────────────────────────────────────────
-
-def get_etf_universe(client: KRXOpenAPI, base_date: str) -> dict:
+def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict:
+    """타임아웃 시 retry회 재시도. main()에서 1회 호출 → COLLECT/ANALYZE 공유."""
     log("ETF 유니버스 수집 중...")
-    try:
-        df = to_df(client.get_etf_daily_trade(bas_dd=base_date))
-        if df.empty:
-            return {}
-    except Exception as e:
-        log(f"  → ETF 조회 오류: {e}")
-        return {}
+    df = pd.DataFrame()
+    for attempt in range(retry + 1):
+        try:
+            df = to_df(client.get_etf_daily_trade(bas_dd=base_date))
+            if not df.empty:
+                break
+        except Exception as e:
+            log(f"  → ETF 조회 오류 (시도 {attempt+1}/{retry+1}): {e}")
+            if attempt < retry:
+                log("  → 5초 후 재시도...")
+                time.sleep(5)
+            else:
+                return {}
 
     code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
     name_col = find_col(df, ["ISU_NM"])
@@ -340,30 +182,117 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str) -> dict:
 
 
 def get_stock_info_bulk(client: KRXOpenAPI, base_date: str) -> dict:
+    """main()에서 1회 호출 → ANALYZE 공유."""
     stock_info = {}
     for get_fn in [client.get_stock_daily_trade, client.get_kosdaq_stock_daily_trade]:
         try:
             df = to_df(get_fn(bas_dd=base_date))
-            if df.empty:
-                continue
+            if df.empty: continue
             code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
             name_col = find_col(df, ["ISU_NM"])
             cap_col  = find_col(df, ["MKTCAP"])
-            if not code_col or not name_col:
-                continue
+            if not code_col or not name_col: continue
             for _, row in df.iterrows():
                 try:
                     t = str(row[code_col]).strip().zfill(6)
                     n = str(row[name_col]).strip()
                     c = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
                     stock_info[t] = {"name": n, "mktcap": c}
-                except:
-                    continue
+                except: continue
             time.sleep(0.3)
-        except:
-            continue
+        except Exception as e:
+            log(f"  → 주식 조회 오류: {e}")
     log(f"  → 주식 종목 {len(stock_info)}개 수집")
     return stock_info
+
+
+# ─── KIS ETF 데이터 수집 ──────────────────────────────
+
+def get_etf_data_today(etf_tickers: list, token: str) -> dict:
+    result = {}
+    for i, ticker in enumerate(etf_tickers):
+        data = kis_get("/uapi/etfetn/v1/quotations/inquire-price", "FHPST02400000",
+                       {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token)
+        output = data.get("output", {})
+        try:
+            lstn_stcn = float(str(output.get("lstn_stcn", "0") or "0").replace(",", ""))
+            nav_raw   = float(str(output.get("nav", "0") or "0").replace(",", ""))
+            cnt       = int(float(str(output.get("etf_cnfg_issu_cnt", "0") or "0").replace(",", "")))
+            if lstn_stcn > 0 and nav_raw > 0:
+                result[ticker] = {"lstn_stcn": lstn_stcn, "nav": nav_raw, "cnt": cnt}
+        except: pass
+        if (i + 1) % 5 == 0:
+            time.sleep(1.1)
+    log(f"  → ETF 데이터 수집: {len(result)}개")
+    return result
+
+
+# ─── KIS ETF 구성종목 ─────────────────────────────────
+
+def get_etf_components_kis(etf_ticker: str, token: str) -> list:
+    data = kis_get("/uapi/etfetn/v1/quotations/inquire-component-stock-price", "FHKST121600C0",
+                   {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": etf_ticker, "FID_COND_SCR_DIV_CODE": "11216"}, token)
+    holdings = []
+    for row in data.get("output2", []):
+        code   = str(row.get("stck_shrn_iscd", "")).strip().zfill(6)
+        name   = str(row.get("hts_kor_isnm", "")).strip()
+        weight = float(str(row.get("etf_cnfg_issu_rlim", 0) or 0))
+        if len(code) == 6 and code.isdigit() and weight > 0:
+            holdings.append({"ticker": code, "name": name, "weight": weight})
+    return holdings
+
+
+# ─── KIS 투자자별 순매수 - 일자별 ────────────────────────
+
+def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
+    data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
+                   {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token)
+    output   = data.get("output", [])
+    daily    = []
+    frgn_sum = 0.0
+    orgn_sum = 0.0
+    for row in output[:days]:
+        try:
+            date_raw = str(row.get("stck_bsop_date", ""))
+            date_str = f"{date_raw[4:6]}/{date_raw[6:8]}" if len(date_raw) == 8 else "??"
+            frgn = float(str(row.get("frgn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
+            orgn = float(str(row.get("orgn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
+            if frgn == 0 and orgn == 0: continue
+            daily.append({"date": date_str, "frgn": frgn, "orgn": orgn})
+            frgn_sum += frgn
+            orgn_sum += orgn
+        except: continue
+    return {"daily": daily, "frgn_sum": frgn_sum, "orgn_sum": orgn_sum}
+
+
+# ─── KIS 이격도 + 거래대금 ────────────────────────────────
+
+def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> dict:
+    data = kis_get("/uapi/domestic-stock/v1/quotations/inquire-daily-price", "FHKST01010400",
+                   {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
+                    "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"}, token)
+    output      = data.get("output", [])
+    disparity   = 0.0
+    vol_5d_avg  = 0.0
+    vol_20d_avg = 0.0
+    if not output:
+        return {"disparity": disparity, "vol_5d_avg": vol_5d_avg, "vol_20d_avg": vol_20d_avg}
+    try:
+        if len(output) >= n + 1:
+            prices = [float(str(row.get("stck_clpr", 0) or 0)) for row in output[:n + 1]]
+            if not any(p == 0 for p in prices):
+                disparity = (prices[0] / (sum(prices[:n]) / n) - 1) * 100
+
+        def calc_vol(row):
+            try: return float(str(row.get("stck_clpr",0) or 0)) * float(str(row.get("acml_vol",0) or 0))
+            except: return 0.0
+
+        vols_5  = [v for r in output[:5]  if (v := calc_vol(r)) > 0]
+        vols_20 = [v for r in output[:20] if (v := calc_vol(r)) > 0]
+        if vols_5:  vol_5d_avg  = sum(vols_5)  / len(vols_5)
+        if vols_20: vol_20d_avg = sum(vols_20) / len(vols_20)
+    except: pass
+    return {"disparity": disparity, "vol_5d_avg": vol_5d_avg, "vol_20d_avg": vol_20d_avg}
 
 
 # ─── 유틸 ────────────────────────────────────────────
@@ -374,28 +303,20 @@ def fmt(n: float) -> str:
     if abs(n) >= 1e4:  return f"{n/1e4:.0f}만"
     return f"{n:,.0f}"
 
-
 def fmt_flow(n: float) -> str:
-    sign = "+" if n >= 0 else ""
-    return f"{sign}{fmt(n)}"
+    return f"{'+'if n>=0 else ''}{fmt(n)}"
 
-
-def fmt_investor_daily(daily: list, frgn_sum: float, orgn_sum: float) -> str:
-    if not daily:
-        return "  외인/기관: 데이터 없음"
+def fmt_investor_daily(daily, frgn_sum, orgn_sum):
+    if not daily: return "  외인/기관: 데이터 없음"
     rows = list(reversed(daily))
-    frgn_parts = " | ".join(f"{r['date']} {fmt_flow(r['frgn'])}" for r in rows)
-    orgn_parts = " | ".join(f"{r['date']} {fmt_flow(r['orgn'])}" for r in rows)
     return (
-        f"  외인  {frgn_parts} | 합산 {fmt_flow(frgn_sum)}\n"
-        f"  기관  {orgn_parts} | 합산 {fmt_flow(orgn_sum)}"
+        f"  외인  {' | '.join(f'{r[\"date\"]} {fmt_flow(r[\"frgn\"])}' for r in rows)} | 합산 {fmt_flow(frgn_sum)}\n"
+        f"  기관  {' | '.join(f'{r[\"date\"]} {fmt_flow(r[\"orgn\"])}' for r in rows)} | 합산 {fmt_flow(orgn_sum)}"
     )
-
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN:
-        print(text)
-        return
+        print(text); return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         try:
@@ -407,18 +328,15 @@ def send_telegram(text: str):
 
 # ─── COLLECT ─────────────────────────────────────────
 
-def run_collect(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
+def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
     log("─" * 40)
     log(f"[COLLECT] 기준일: {base_date}")
-
-    etf_info = get_etf_universe(krx, base_date)
     if not etf_info:
-        log("ETF 유니버스 조회 실패")
+        log("ETF 유니버스 없음 → COLLECT 스킵")
         return False
 
     log(f"ETF 데이터 수집 중... ({len(etf_info)}개)")
-    today_data = get_etf_data_today(list(etf_info.keys()), token)
-
+    today_data   = get_etf_data_today(list(etf_info.keys()), token)
     concentrated = sum(1 for v in today_data.values() if v["cnt"] <= MAX_ETF_STOCKS)
     log(f"  → 집중형 (≤{MAX_ETF_STOCKS}종목): {concentrated}개 / 전체 {len(today_data)}개")
 
@@ -426,159 +344,111 @@ def run_collect(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
     cache[base_date] = today_data
     cache = prune_cache(cache, keep_days=14)
     save_aum_cache(cache)
-
     log(f"캐시 저장 완료 | 보유 날짜: {sorted(cache.keys())}")
     return True
 
 
 # ─── ANALYZE ─────────────────────────────────────────
 
-def run_analyze(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
+def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) -> bool:
     log("─" * 40)
-    log("[ANALYZE] ETF 수급 스크리너 v5.6 분석")
+    log("[ANALYZE] ETF 수급 스크리너 v5.7 분석")
 
-    cutoff_dt = datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)
-    cutoff    = cutoff_dt.strftime("%Y%m%d")
-
-    cache = load_aum_cache()
+    cutoff = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
+    cache  = load_aum_cache()
     available_dates = sorted([d for d in cache.keys() if d >= cutoff and d <= base_date])
     log(f"캐시 보유 날짜: {available_dates} ({len(available_dates)}일치)")
 
     if len(available_dates) < 2:
-        log("캐시 데이터 부족 (최소 2일치 필요) → ANALYZE 스킵")
+        log("캐시 데이터 부족 (최소 2일치) → ANALYZE 스킵")
         return False
 
     first_data = cache[available_dates[0]]
     last_data  = cache[available_dates[-1]]
     period_str = f"{available_dates[0][4:6]}/{available_dates[0][6:]} ~ {available_dates[-1][4:6]}/{available_dates[-1][6:]}"
 
-    # 실제 순유입 = 상장주수 변화 × NAV + 집중형 필터
     etf_inflow   = {}
     filtered_cnt = 0
     for ticker in set(first_data.keys()) | set(last_data.keys()):
-        f           = first_data.get(ticker, {})
-        l           = last_data.get(ticker, {})
+        f = first_data.get(ticker, {})
+        l = last_data.get(ticker, {})
         stcn_change = l.get("lstn_stcn", 0) - f.get("lstn_stcn", 0)
-        nav_t       = l.get("nav", 0)
-        cnt         = l.get("cnt", 999)
-        if stcn_change <= 0 or nav_t <= 0:
-            continue
+        nav_t = l.get("nav", 0)
+        cnt   = l.get("cnt", 999)
+        if stcn_change <= 0 or nav_t <= 0: continue
         if cnt > MAX_ETF_STOCKS:
-            filtered_cnt += 1
-            continue
+            filtered_cnt += 1; continue
         etf_inflow[ticker] = stcn_change * nav_t
 
     log(f"순유입 집중형 ETF: {len(etf_inflow)}개 (지수형 제외: {filtered_cnt}개)")
 
-    etf_info = get_etf_universe(krx, base_date)
-
-    top_etfs = sorted(
-        [(t, v) for t, v in etf_inflow.items() if t in etf_info],
-        key=lambda x: x[1], reverse=True
-    )[:TOP_ETF_N]
-
+    top_etfs = sorted([(t, v) for t, v in etf_inflow.items() if t in etf_info],
+                      key=lambda x: x[1], reverse=True)[:TOP_ETF_N]
     log(f"상위 {len(top_etfs)}개 집중형 ETF 선정")
     for i, (t, v) in enumerate(top_etfs[:5], 1):
         cnt = last_data.get(t, {}).get("cnt", "?")
-        log(f"  {i}. {etf_info.get(t, {}).get('name', t)} ({t}) | 구성{cnt}종목 | +{fmt(v)}")
+        log(f"  {i}. {etf_info.get(t,{}).get('name',t)} ({t}) | 구성{cnt}종목 | +{fmt(v)}")
 
     if not top_etfs:
-        log("선정된 ETF 없음")
-        return False
+        log("선정된 ETF 없음"); return False
 
-    # ── 편입종목 역추적 ──────────────────────────────────
     log("\n편입종목 역추적 중...")
     stock_inflow = {}
     pdf_ok = 0
-
     for etf_ticker, inflow in top_etfs:
         holdings = get_etf_components_kis(etf_ticker, token)
         if not holdings:
-            time.sleep(0.2)
-            continue
+            time.sleep(0.2); continue
         pdf_ok += 1
         total_wt = sum(h["weight"] for h in holdings)
         for h in holdings:
-            wt      = h["weight"] / total_wt if total_wt > 0 else 0
-            contrib = inflow * wt
-            stock_inflow[h["ticker"]] = stock_inflow.get(h["ticker"], 0) + contrib
+            wt = h["weight"] / total_wt if total_wt > 0 else 0
+            stock_inflow[h["ticker"]] = stock_inflow.get(h["ticker"], 0) + inflow * wt
         time.sleep(0.15)
-
     log(f"  → PDF 성공: {pdf_ok}/{len(top_etfs)} | 집계 종목: {len(stock_inflow)}개")
-
-    if pdf_ok == 0:
-        return False
-
-    # ── 종목 정보 수집 ────────────────────────────────────
-    log("\n종목 정보 수집 중...")
-    stock_info = get_stock_info_bulk(krx, base_date)
+    if pdf_ok == 0: return False
 
     candidates = []
     for ticker, inflow in stock_inflow.items():
-        if inflow < MIN_STOCK_INFLOW:
-            continue
-        info   = stock_info.get(ticker, {})
-        name   = info.get("name", "")
-        mktcap = info.get("mktcap", 0)
-        if not name:
-            continue
-        candidates.append({"ticker": ticker, "name": name, "inflow": inflow, "mktcap": mktcap})
-
+        if inflow < MIN_STOCK_INFLOW: continue
+        info = stock_info.get(ticker, {})
+        if not info.get("name"): continue
+        candidates.append({"ticker": ticker, "name": info["name"], "inflow": inflow, "mktcap": info.get("mktcap", 0)})
     candidates.sort(key=lambda x: x["inflow"], reverse=True)
     top_candidates = candidates[:CANDIDATE_N]
     log(f"  → 후보 종목: {len(top_candidates)}개")
 
-    # ── 이격도 + 거래대금 + 투자자 수집 ─────────────────────
     investor_days = get_investor_days()
-    weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
+    weekday_name  = ["월","화","수","목","금"][datetime.today().weekday()]
     liq_label     = fmt(MIN_LIQUIDITY_20D)
     log(f"\n이격도({DISPARITY_PERIOD}일) + 거래대금(5/20일) + 투자자({investor_days}일) 수집 중...")
 
-    results      = []
+    results = []
     liq_filtered = 0
-
     for c in top_candidates:
-        ticker = c["ticker"]
-
-        price_data  = get_disparity_and_volume(ticker, token)
+        ticker     = c["ticker"]
+        price_data = get_disparity_and_volume(ticker, token)
         disp        = price_data["disparity"]
         vol_5d_avg  = price_data["vol_5d_avg"]
         vol_20d_avg = price_data["vol_20d_avg"]
 
-        # 유동성 필터
         if vol_20d_avg > 0 and vol_20d_avg < MIN_LIQUIDITY_20D:
-            liq_filtered += 1
-            time.sleep(0.05)
-            continue
+            liq_filtered += 1; time.sleep(0.05); continue
 
         intensity = (c["inflow"] / vol_5d_avg) if vol_5d_avg > 0 else 0.0
-
-        investor = get_investor_net_buy_daily(ticker, token, days=investor_days)
-        frgn_sum = investor["frgn_sum"]
-        orgn_sum = investor["orgn_sum"]
+        investor  = get_investor_net_buy_daily(ticker, token, days=investor_days)
+        frgn_sum  = investor["frgn_sum"]
+        orgn_sum  = investor["orgn_sum"]
 
         tags = []
-        if c["mktcap"] > 0 and c["mktcap"] < 1_000_000_000_000:
-            tags.append("🔹소형주")
-        if disp < DISPARITY_THRESH:
-            tags.append("📉단기하락")
-        if intensity >= FLOW_INTENSITY_HI:
-            tags.append("🔥수급강도↑")
-        if frgn_sum > 0:
-            tags.append("🌐외국인↑")
-        if orgn_sum > 0:
-            tags.append("🏦기관↑")
+        if c["mktcap"] > 0 and c["mktcap"] < 1_000_000_000_000: tags.append("🔹소형주")
+        if disp < DISPARITY_THRESH:        tags.append("📉단기하락")
+        if intensity >= FLOW_INTENSITY_HI: tags.append("🔥수급강도↑")
+        if frgn_sum > 0: tags.append("🌐외국인↑")
+        if orgn_sum > 0: tags.append("🏦기관↑")
 
-        results.append({
-            **c,
-            "investor":   investor,
-            "frgn_sum":   frgn_sum,
-            "orgn_sum":   orgn_sum,
-            "disp":       disp,
-            "vol_5d_avg": vol_5d_avg,
-            "intensity":  intensity,
-            "tags":       " ".join(tags),
-        })
+        results.append({**c, "investor": investor, "frgn_sum": frgn_sum, "orgn_sum": orgn_sum,
+                        "disp": disp, "vol_5d_avg": vol_5d_avg, "intensity": intensity, "tags": " ".join(tags)})
         time.sleep(0.15)
 
     log(f"  → 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})")
@@ -586,9 +456,8 @@ def run_analyze(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
     top = results[:TOP_N]
     log(f"\n  → 최종 선별: {len(top)}개")
 
-    # ── 텔레그램 발송 ─────────────────────────────────────
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.6</b>\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.7</b>\n"
     msg += f"🗓 {now}  |  분석: {period_str} ({len(available_dates)}일)\n"
     msg += f"📌 집중형 ETF {len(top_etfs)}개 순유입 → <b>{len(top)}개 종목</b>\n"
     msg += f"💧 유동성 {liq_label} 미만 제외 {liq_filtered}개  |  외인/기관 {weekday_name}요일 {investor_days}일\n"
@@ -603,18 +472,14 @@ def run_analyze(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
             disp_icon     = "📉" if r["disp"] < DISPARITY_THRESH else ("📈" if r["disp"] > 2.0 else "")
             intensity_str = f"{r['intensity']:.1f}x" if r["intensity"] > 0 else "N/A"
             tag_str       = f"\n  {r['tags']}" if r["tags"] else ""
-
-            investor_str = fmt_investor_daily(
-                r["investor"]["daily"], r["frgn_sum"], r["orgn_sum"]
-            )
-
+            investor_str  = fmt_investor_daily(r["investor"]["daily"], r["frgn_sum"], r["orgn_sum"])
             msg += (
                 f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
                 f"  💰 ETF유입: {fmt(r['inflow'])}  |  📊 이격도: {disp_str} {disp_icon}\n"
                 f"  ⚡ 수급강도: {intensity_str} (ETF유입/5일평균, {liq_label}이상)\n"
                 f"  🏢 시총: {cap_str}{tag_str}\n"
                 f"{investor_str}\n"
-                f"{'─' * 20}\n\n"
+                f"{'─'*20}\n\n"
             )
 
     send_telegram(msg)
@@ -625,33 +490,37 @@ def run_analyze(krx: KRXOpenAPI, token: str, base_date: str) -> bool:
 
 def main():
     if not KRX_API_KEY:
-        log("KRX_API_KEY 없음. 종료.")
-        return
+        log("KRX_API_KEY 없음. 종료."); return
     if not KIS_APP_KEY or not KIS_APP_SECRET:
-        log("KIS_APP_KEY/SECRET 없음. 종료.")
-        return
+        log("KIS_APP_KEY/SECRET 없음. 종료."); return
 
     base_date = get_recent_business_day(1)
     log("=" * 50)
-    log(f"ETF 수급 스크리너 v5.6 | 기준일: {base_date}")
+    log(f"ETF 수급 스크리너 v5.7 | 기준일: {base_date}")
     log("=" * 50)
 
     log("KIS 토큰 발급 중...")
     token = get_kis_token()
     if not token:
-        log("KIS 토큰 실패. 종료.")
-        return
+        log("KIS 토큰 실패. 종료."); return
     log("  → 토큰 발급 성공")
 
     krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
 
-    collect_ok = run_collect(krx, token, base_date)
+    # KRX 데이터 1회만 수집 → COLLECT + ANALYZE 공유
+    log("\nKRX 데이터 수집 중...")
+    etf_info   = get_etf_universe(krx, base_date, retry=1)
+    stock_info = get_stock_info_bulk(krx, base_date)
+
+    if not etf_info:
+        log("ETF 유니버스 수집 실패. 종료."); return
+
+    collect_ok = run_collect(etf_info, token, base_date)
     if not collect_ok:
-        log("COLLECT 실패. ANALYZE 스킵.")
-        return
+        log("COLLECT 실패. ANALYZE 스킵."); return
 
     log("")
-    run_analyze(krx, token, base_date)
+    run_analyze(etf_info, stock_info, token, base_date)
     log("\n완료!")
 
 
