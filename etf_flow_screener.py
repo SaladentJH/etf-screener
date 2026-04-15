@@ -2,15 +2,17 @@
 ETF 수급 기반 종목 스크리너 v5.11
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경 (v5.10 → v5.11):
-  - EXCLUDE_KEYWORDS 대폭 강화
-    기존: 채권, 국채 등 일부 키워드만
-    변경: 채권형/혼합형/통화형 ETF를 포괄하는 키워드 추가
-    추가 키워드: 국고채, 회사채, 하이일드, 크레딧, 금리, 듀레이션,
-                TLT, AGG, 통안채, 은행채, 특수채, 물가채, 10년, 30년,
-                혼합, 멀티에셋, 인컴, 배당성장, 배당귀족 (배당주 ETF 제외 목적)
-    단, "배당"만 단독으로는 제외 안 함 (주식형 배당 ETF 허용)
-  - 로그에 필터된 ETF 목록 출력 추가 (디버깅용)
+전략 스킴:
+  개인 자금 → ETF 유입 → PDF 역추적 → 개별종목 수급 파악
+  외국인 동반 수급 여부 확인 → 수급강도 측정
+
+주요 설정:
+  - 채권/해외/원자재 ETF 필터 강화
+  - 수급강도 2개: ETF수급강도(ETF유입/5일평균) + 개인수급강도(개인순매수/5일평균)
+  - 거래대금: stck_clpr × acml_vol (쉼표 제거 처리)
+  - 기관 제거, 외국인+개인만 표시
+  - 시총 1조 이상 / 20일평균거래대금 200억 이상 필터
+  - 정렬: ETF수급강도 내림차순
 """
 
 import os
@@ -46,40 +48,24 @@ FLOW_INTENSITY_HI = 3.0
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
-# ─── ETF 제외 키워드 (강화) ───────────────────────────
-# 레버리지/인버스
 EXCLUDE_KEYWORDS = [
     "레버리지", "인버스", "2X", "3X", "-1X", "곱버스",
-
-    # 해외/지역
     "해외", "미국", "중국", "일본", "인도", "베트남", "나스닥", "S&P",
     "유럽", "신흥국", "이머징", "글로벌", "아시아", "홍콩", "대만",
     "브라질", "러시아", "인도네시아", "멕시코",
-
-    # 채권/금리 관련 (대폭 강화)
     "채권", "국채", "국고채", "회사채", "하이일드", "크레딧",
     "금리", "듀레이션", "통안채", "은행채", "특수채", "물가채",
     "10년", "30년", "3년", "5년", "단기채", "중기채", "장기채",
     "TLT", "AGG", "IEF", "LQD", "HYG",
     "우량채", "혼합채", "채권혼합",
-
-    # 통화/원자재
     "달러", "엔화", "위안", "유로", "환헤지", "환노출",
     "금", "은", "구리", "선물", "WTI", "유가", "원유", "천연가스",
     "농산물", "원자재", "상품",
-
-    # 파생/구조화
     "커버드콜", "covered", "프리미엄", "위클리", "옵션",
     "버퍼", "테일헤지",
-
-    # 단기금융
     "머니마켓", "MMF", "단기", "CD금리", "KOFR", "SOFR",
     "CP", "콜", "RP",
-
-    # 부동산/인프라
     "부동산", "리츠", "REIT", "인프라",
-
-    # 혼합/멀티에셋
     "혼합", "멀티에셋", "인컴", "TDF",
 ]
 
@@ -203,8 +189,8 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict
     if not code_col or not name_col:
         return {}
 
-    etf_info    = {}
-    excluded    = []
+    etf_info = {}
+    excluded = []
     for _, row in df.iterrows():
         try:
             ticker = str(row[code_col]).strip().zfill(6)
@@ -219,10 +205,9 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict
             continue
 
     log(f"  → 유효 ETF {len(etf_info)}개 (제외: {len(excluded)}개)")
-    # 디버깅: 제외된 ETF 중 채권 관련 상위 10개 출력
-    bond_excluded = [n for n in excluded if any(kw in n for kw in ["국고채", "채권", "금리", "10년", "30년"])]
-    if bond_excluded:
-        log(f"  → 채권 관련 제외 예시: {bond_excluded[:5]}")
+    bond_ex = [n for n in excluded if any(kw in n for kw in ["국고채", "채권", "금리", "10년", "30년"])]
+    if bond_ex:
+        log(f"  → 채권 관련 제외 예시: {bond_ex[:5]}")
     return etf_info
 
 
@@ -297,6 +282,11 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 # ─── KIS 투자자별 순매수 - 외국인 + 개인 일자별 ──────────
 
 def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
+    """
+    FHKST01010900 - output[0]=당일, output[1]=전일 ...
+    frgn==0 and prsn==0 동시 → 장 미개장 → 제외
+    단위: 백만원 × 1,000,000 = 원
+    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token,
@@ -305,7 +295,6 @@ def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
     daily    = []
     frgn_sum = 0.0
     prsn_sum = 0.0
-
     for row in output[:days]:
         try:
             date_raw = str(row.get("stck_bsop_date", ""))
@@ -319,13 +308,18 @@ def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
             prsn_sum += prsn
         except:
             continue
-
     return {"daily": daily, "frgn_sum": frgn_sum, "prsn_sum": prsn_sum}
 
 
 # ─── KIS 이격도 + 거래대금 ────────────────────────────────
 
 def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> dict:
+    """
+    FHKST01010400 - 이격도 + 거래대금 단일 호출
+    거래대금 = stck_clpr × acml_vol
+    - output[1:]부터 사용 (output[0]=당일 acml_vol=0 이슈 제거)
+    - .replace(",", "") 적용 (KIS API 쉼표 포함 숫자 처리)
+    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-daily-price", "FHKST01010400",
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
@@ -340,22 +334,36 @@ def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD)
         return {"disparity": disparity, "vol_5d_avg": vol_5d_avg, "vol_20d_avg": vol_20d_avg}
 
     try:
+        # n일 이격도
         if len(output) >= n + 1:
-            prices = [float(str(row.get("stck_clpr", 0) or 0)) for row in output[:n + 1]]
+            prices = [
+                float(str(row.get("stck_clpr", 0) or 0).replace(",", ""))
+                for row in output[:n + 1]
+            ]
             if not any(p == 0 for p in prices):
                 disparity = (prices[0] / (sum(prices[:n]) / n) - 1) * 100
 
+        # 거래대금 = 종가 × 거래량 (쉼표 제거 필수)
         def calc_vol(row):
             try:
-                return float(str(row.get("stck_clpr", 0) or 0)) * float(str(row.get("acml_vol", 0) or 0))
+                clpr = float(str(row.get("stck_clpr", 0) or 0).replace(",", ""))
+                vol  = float(str(row.get("acml_vol", 0) or 0).replace(",", ""))
+                return clpr * vol
             except:
                 return 0.0
 
+        # output[1:]부터: 전일 확정 데이터 (당일 acml_vol=0 제거)
         confirmed = output[1:]
         vols_5  = [calc_vol(r) for r in confirmed[:5]  if calc_vol(r) > 0]
         vols_20 = [calc_vol(r) for r in confirmed[:20] if calc_vol(r) > 0]
         if vols_5:  vol_5d_avg  = sum(vols_5)  / len(vols_5)
         if vols_20: vol_20d_avg = sum(vols_20) / len(vols_20)
+
+        # 디버그 로그: vol 결과 확인 (최초 1회)
+        if not getattr(get_disparity_and_volume, "_debug_done", False):
+            log(f"  [DEBUG vol] {ticker} | clpr={output[1].get('stck_clpr')} acml_vol={output[1].get('acml_vol')} → 5d={vol_5d_avg:.0f}")
+            get_disparity_and_volume._debug_done = True
+
     except:
         pass
 
@@ -537,10 +545,14 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             time.sleep(0.05)
             continue
 
+        # ETF수급강도 = ETF유입기여 / 5일평균거래대금
         etf_intensity  = (c["inflow"] / vol_5d_avg) if vol_5d_avg > 0 else 0.0
-        investor = get_investor_net_buy_daily(ticker, token, days=investor_days)
-        frgn_sum = investor["frgn_sum"]
-        prsn_sum = investor["prsn_sum"]
+
+        investor  = get_investor_net_buy_daily(ticker, token, days=investor_days)
+        frgn_sum  = investor["frgn_sum"]
+        prsn_sum  = investor["prsn_sum"]
+
+        # 개인수급강도 = 개인순매수 합산 / 5일평균거래대금
         prsn_intensity = (prsn_sum / vol_5d_avg) if vol_5d_avg > 0 else 0.0
 
         subj_tags = []
