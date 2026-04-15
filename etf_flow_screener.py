@@ -1,14 +1,10 @@
 """
-ETF 수급 기반 종목 스크리너 v5.7
+ETF 수급 기반 종목 스크리너 v5.9
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경 (v5.6 → v5.7):
-  - KRX get_etf_universe() 중복 호출 제거
-    v5.6: COLLECT + ANALYZE 각각 호출(총 2회) → ANALYZE에서 타임아웃
-    v5.7: main()에서 1회 호출 후 COLLECT/ANALYZE 공유
-  - KRX API 재시도 로직 추가 (타임아웃 시 5초 대기 후 1회 재시도)
-  - get_stock_info_bulk() 도 main()에서 1회 호출로 통합
-  - f-string 백슬래시 SyntaxError 수정 (Python 3.11 이하 호환)
+변경 (v5.8 → v5.9):
+  - 시총 옆 특성태그(🔹소형주 📉단기하락 🔥수급강도↑) 제거 → 시총만 표시
+  - 수급주체(🌐외국인↑ 🏦기관↑) 별도 줄 유지
 """
 
 import os
@@ -30,16 +26,16 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW  = 3_000_000_000    # 종목 최소 ETF 유입 기여액 (3억)
-MIN_LIQUIDITY_20D = 20_000_000_000   # 20일 평균거래대금 최소 기준 (200억)
+MIN_STOCK_INFLOW  = 3_000_000_000
+MIN_LIQUIDITY_20D = 20_000_000_000
 TOP_ETF_N         = 30
 CANDIDATE_N       = 30
 TOP_N             = 30
 LOOKBACK_DAYS     = 7
-DISPARITY_PERIOD  = 20               # 이격도 기간 (20일)
+DISPARITY_PERIOD  = 20
 DISPARITY_THRESH  = -2.0
-MAX_ETF_STOCKS    = 30               # 집중형 ETF 기준
-FLOW_INTENSITY_HI = 3.0              # 수급강도 고강도 기준 (3x → 🔥)
+MAX_ETF_STOCKS    = 30
+FLOW_INTENSITY_HI = 3.0
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
@@ -51,7 +47,6 @@ EXCLUDE_KEYWORDS = [
     "머니마켓", "MMF", "단기", "CD금리", "KOFR", "SOFR",
     "부동산", "리츠", "REIT",
 ]
-# ──────────────────────────────────────────────────────
 
 
 def log(msg):
@@ -100,7 +95,6 @@ def find_col(df, keywords):
 
 
 # ─── 캐시 ────────────────────────────────────────────
-# {날짜: {ticker: {"lstn_stcn": float, "nav": float, "cnt": int}}}
 
 def load_aum_cache() -> dict:
     if os.path.exists(AUM_CACHE_FILE):
@@ -153,10 +147,6 @@ def kis_get(path: str, tr_id: str, params: dict, token: str) -> dict:
 # ─── KRX API (main에서 1회만 호출, 재시도 포함) ──────────
 
 def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict:
-    """
-    타임아웃 시 retry회 재시도.
-    main()에서 1회 호출 후 COLLECT/ANALYZE 공유 → 중복 호출 제거.
-    """
     log("ETF 유니버스 수집 중...")
     df = pd.DataFrame()
     for attempt in range(retry + 1):
@@ -194,7 +184,6 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict
 
 
 def get_stock_info_bulk(client: KRXOpenAPI, base_date: str) -> dict:
-    """main()에서 1회 호출 후 ANALYZE 공유."""
     stock_info = {}
     for get_fn in [client.get_stock_daily_trade, client.get_kosdaq_stock_daily_trade]:
         try:
@@ -224,10 +213,6 @@ def get_stock_info_bulk(client: KRXOpenAPI, base_date: str) -> dict:
 # ─── KIS ETF 데이터 수집 ──────────────────────────────
 
 def get_etf_data_today(etf_tickers: list, token: str) -> dict:
-    """
-    FHPST02400000 (ETF/ETN 현재가)
-    lstn_stcn: 상장주수, nav: NAV(원), etf_cnfg_issu_cnt: 구성종목수
-    """
     result = {}
     for i, ticker in enumerate(etf_tickers):
         data = kis_get(
@@ -269,11 +254,6 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 # ─── KIS 투자자별 순매수 - 일자별 ────────────────────────
 
 def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
-    """
-    FHKST01010900 - output[0]=당일, output[1]=전일 ...
-    frgn==0 and orgn==0 동시 → 장 미개장 데이터 → 제외
-    단위: 백만원 × 1,000,000 = 원
-    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token,
@@ -298,12 +278,12 @@ def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
     return {"daily": daily, "frgn_sum": frgn_sum, "orgn_sum": orgn_sum}
 
 
-# ─── KIS 이격도 + 거래대금 (단일 API 호출) ───────────────
+# ─── KIS 이격도 + 거래대금 ────────────────────────────────
 
 def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> dict:
     """
     FHKST01010400 - 이격도 + 거래대금 단일 호출
-    거래대금: stck_clpr × acml_vol (acml_tr_pbmn 장마감 후 0 이슈 회피)
+    거래대금: output[1:]부터 사용 (output[0]=당일, acml_vol=0 이슈 제거)
     """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-daily-price", "FHKST01010400",
@@ -319,21 +299,20 @@ def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD)
         return {"disparity": disparity, "vol_5d_avg": vol_5d_avg, "vol_20d_avg": vol_20d_avg}
 
     try:
-        # n일 이격도
         if len(output) >= n + 1:
             prices = [float(str(row.get("stck_clpr", 0) or 0)) for row in output[:n + 1]]
             if not any(p == 0 for p in prices):
                 disparity = (prices[0] / (sum(prices[:n]) / n) - 1) * 100
 
-        # 거래대금 = 종가 × 누적거래량
         def calc_vol(row):
             try:
                 return float(str(row.get("stck_clpr", 0) or 0)) * float(str(row.get("acml_vol", 0) or 0))
             except:
                 return 0.0
 
-        vols_5  = [calc_vol(r) for r in output[:5]  if calc_vol(r) > 0]
-        vols_20 = [calc_vol(r) for r in output[:20] if calc_vol(r) > 0]
+        confirmed = output[1:]
+        vols_5  = [calc_vol(r) for r in confirmed[:5]  if calc_vol(r) > 0]
+        vols_20 = [calc_vol(r) for r in confirmed[:20] if calc_vol(r) > 0]
         if vols_5:  vol_5d_avg  = sum(vols_5)  / len(vols_5)
         if vols_20: vol_20d_avg = sum(vols_20) / len(vols_20)
     except:
@@ -357,9 +336,6 @@ def fmt_flow(n: float) -> str:
 
 
 def fmt_investor_daily(daily: list, frgn_sum: float, orgn_sum: float) -> str:
-    """
-    f-string 안에 백슬래시 불가 (Python 3.11 이하) → 변수로 분리
-    """
     if not daily:
         return "  외인/기관: 데이터 없음"
     rows = list(reversed(daily))
@@ -388,10 +364,6 @@ def send_telegram(text: str):
 # ─── COLLECT ─────────────────────────────────────────
 
 def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
-    """
-    etf_info: main()에서 미리 수집한 ETF 유니버스 (KRX 중복 호출 방지)
-    ETF 상장주수 + NAV + 구성종목수 수집 → 캐시 저장
-    """
     log("─" * 40)
     log(f"[COLLECT] 기준일: {base_date}")
     if not etf_info:
@@ -414,12 +386,8 @@ def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
 # ─── ANALYZE ─────────────────────────────────────────
 
 def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) -> bool:
-    """
-    etf_info, stock_info: main()에서 미리 수집 (KRX 중복 호출 방지)
-    캐시 2일치 미만이면 조용히 스킵
-    """
     log("─" * 40)
-    log("[ANALYZE] ETF 수급 스크리너 v5.7 분석")
+    log("[ANALYZE] ETF 수급 스크리너 v5.9 분석")
 
     cutoff = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
     cache  = load_aum_cache()
@@ -437,7 +405,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         f"{available_dates[-1][4:6]}/{available_dates[-1][6:]}"
     )
 
-    # 실제 순유입 = 상장주수 변화 × NAV + 집중형 필터
     etf_inflow   = {}
     filtered_cnt = 0
     for ticker in set(first_data.keys()) | set(last_data.keys()):
@@ -469,7 +436,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         log("선정된 ETF 없음")
         return False
 
-    # ── 편입종목 역추적 ──────────────────────────────────
     log("\n편입종목 역추적 중...")
     stock_inflow = {}
     pdf_ok = 0
@@ -488,7 +454,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     if pdf_ok == 0:
         return False
 
-    # ── 후보 종목 필터 ────────────────────────────────────
     candidates = []
     for ticker, inflow in stock_inflow.items():
         if inflow < MIN_STOCK_INFLOW:
@@ -506,7 +471,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     top_candidates = candidates[:CANDIDATE_N]
     log(f"  → 후보 종목: {len(top_candidates)}개")
 
-    # ── 이격도 + 거래대금 + 투자자 수집 ─────────────────────
     investor_days = get_investor_days()
     weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
     liq_label     = fmt(MIN_LIQUIDITY_20D)
@@ -531,17 +495,12 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         frgn_sum  = investor["frgn_sum"]
         orgn_sum  = investor["orgn_sum"]
 
-        tags = []
-        if c["mktcap"] > 0 and c["mktcap"] < 1_000_000_000_000:
-            tags.append("🔹소형주")
-        if disp < DISPARITY_THRESH:
-            tags.append("📉단기하락")
-        if intensity >= FLOW_INTENSITY_HI:
-            tags.append("🔥수급강도↑")
+        # 수급주체만 태그로 표시
+        subj_tags = []
         if frgn_sum > 0:
-            tags.append("🌐외국인↑")
+            subj_tags.append("🌐외국인↑")
         if orgn_sum > 0:
-            tags.append("🏦기관↑")
+            subj_tags.append("🏦기관↑")
 
         results.append({
             **c,
@@ -551,7 +510,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             "disp":       disp,
             "vol_5d_avg": vol_5d_avg,
             "intensity":  intensity,
-            "tags":       " ".join(tags),
+            "subj_tags":  " ".join(subj_tags),
         })
         time.sleep(0.15)
 
@@ -563,7 +522,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     # ── 텔레그램 발송 ─────────────────────────────────────
     divider = "─" * 20
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.7</b>\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.9</b>\n"
     msg += f"🗓 {now}  |  분석: {period_str} ({len(available_dates)}일)\n"
     msg += f"📌 집중형 ETF {len(top_etfs)}개 순유입 → <b>{len(top)}개 종목</b>\n"
     msg += f"💧 유동성 {liq_label} 미만 제외 {liq_filtered}개  |  외인/기관 {weekday_name}요일 {investor_days}일\n"
@@ -577,13 +536,14 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             disp_str      = f"{r['disp']:+.1f}%" if r["disp"] != 0 else "N/A"
             disp_icon     = "📉" if r["disp"] < DISPARITY_THRESH else ("📈" if r["disp"] > 2.0 else "")
             intensity_str = f"{r['intensity']:.1f}x" if r["intensity"] > 0 else "N/A"
-            tag_str       = f"\n  {r['tags']}" if r["tags"] else ""
+            subj_str      = f"  수급주체: {r['subj_tags']}\n" if r["subj_tags"] else ""
             investor_str  = fmt_investor_daily(r["investor"]["daily"], r["frgn_sum"], r["orgn_sum"])
             msg += (
                 f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
+                f"  🏢 시총: {cap_str}\n"
                 f"  💰 ETF유입: {fmt(r['inflow'])}  |  📊 이격도: {disp_str} {disp_icon}\n"
                 f"  ⚡ 수급강도: {intensity_str} (ETF유입/5일평균, {liq_label}이상)\n"
-                f"  🏢 시총: {cap_str}{tag_str}\n"
+                f"{subj_str}"
                 f"{investor_str}\n"
                 f"{divider}\n\n"
             )
@@ -604,7 +564,7 @@ def main():
 
     base_date = get_recent_business_day(1)
     log("=" * 50)
-    log(f"ETF 수급 스크리너 v5.7 | 기준일: {base_date}")
+    log(f"ETF 수급 스크리너 v5.9 | 기준일: {base_date}")
     log("=" * 50)
 
     log("KIS 토큰 발급 중...")
@@ -616,7 +576,6 @@ def main():
 
     krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
 
-    # KRX 데이터 1회만 수집 → COLLECT + ANALYZE 공유
     log("\nKRX 데이터 수집 중...")
     etf_info   = get_etf_universe(krx, base_date, retry=1)
     stock_info = get_stock_info_bulk(krx, base_date)
