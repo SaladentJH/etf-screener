@@ -6,12 +6,20 @@ ETF 수급 기반 종목 스크리너 v5.12
   개인 자금 → ETF 유입 → PDF 역추적 → 개별종목 수급 파악
   외국인 동반 수급 여부 확인 → 개인수급강도 측정
 
+개인수급강도 계산:
+  개인수급강도 = 개인순매수 5일 일평균 / 거래대금 5일 일평균
+             = (개인순매수 5일 합산 / 5) / (거래대금 5일 합산 / 5)
+             분자·분모 모두 5일 기준으로 통일
+
+표시:
+  외인/개인 일자별 표시 → 요일 기준 N영업일 (기존 유지)
+  개인수급강도 계산 → 항상 5일 고정
+
 변경 (v5.11 → v5.12):
-  - ETF수급강도 표시 제거
-    (대형주 구조상 항상 0.001x 수준 → 노이즈)
-    (내부 계산은 유지, ETF 유입 정보로만 표시)
-  - 개인수급강도(개인순매수/5일평균거래대금)를 메인 지표로 표시
-  - 정렬 기준: 개인수급강도 내림차순 (N/A는 뒤로)
+  - ETF수급강도 표시 제거 (대형주 구조상 항상 0.001x → 노이즈)
+  - 개인수급강도 메인 지표화
+  - 분자·분모 5일 기준 통일 (기존: 분자=요일별 N일, 분모=5일 → 불일치)
+  - 정렬: 개인수급강도 내림차순 (N/A 뒤로)
 """
 
 import os
@@ -43,6 +51,7 @@ LOOKBACK_DAYS     = 7
 DISPARITY_PERIOD  = 20
 DISPARITY_THRESH  = -2.0
 MAX_ETF_STOCKS    = 30
+PRSN_INTENSITY_DAYS = 5   # 개인수급강도 계산 고정 기간
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
@@ -279,21 +288,25 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 
 # ─── KIS 투자자별 순매수 - 외국인 + 개인 일자별 ──────────
 
-def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
+def get_investor_net_buy_daily(ticker: str, token: str, display_days: int) -> dict:
     """
     FHKST01010900 - output[0]=당일, output[1]=전일 ...
-    frgn==0 and prsn==0 동시 → 장 미개장 → 제외
-    단위: 백만원 × 1,000,000 = 원
+    - display_days: 표시용 (요일 기준 N영업일)
+    - 강도 계산용 5일치는 daily_5d에 별도 저장
+    - frgn==0 and prsn==0 동시 → 장 미개장 → 제외
+    - 단위: 백만원 × 1,000,000 = 원
     """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token,
     )
-    output   = data.get("output", [])
-    daily    = []
-    frgn_sum = 0.0
-    prsn_sum = 0.0
-    for row in output[:days]:
+    output = data.get("output", [])
+
+    # 최대 max(display_days, 5)일치 수집 (한 번에)
+    collect_days = max(display_days, PRSN_INTENSITY_DAYS)
+
+    daily_all = []
+    for row in output[:collect_days]:
         try:
             date_raw = str(row.get("stck_bsop_date", ""))
             date_str = f"{date_raw[4:6]}/{date_raw[6:8]}" if len(date_raw) == 8 else "??"
@@ -301,12 +314,25 @@ def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
             prsn = float(str(row.get("prsn_ntby_tr_pbmn", 0) or 0)) * 1_000_000
             if frgn == 0 and prsn == 0:
                 continue
-            daily.append({"date": date_str, "frgn": frgn, "prsn": prsn})
-            frgn_sum += frgn
-            prsn_sum += prsn
+            daily_all.append({"date": date_str, "frgn": frgn, "prsn": prsn})
         except:
             continue
-    return {"daily": daily, "frgn_sum": frgn_sum, "prsn_sum": prsn_sum}
+
+    # 표시용: display_days일치
+    daily_display = daily_all[:display_days]
+    frgn_sum = sum(r["frgn"] for r in daily_display)
+    prsn_sum = sum(r["prsn"] for r in daily_display)
+
+    # 강도 계산용: 5일치 일평균
+    daily_5d = daily_all[:PRSN_INTENSITY_DAYS]
+    prsn_5d_avg = sum(r["prsn"] for r in daily_5d) / PRSN_INTENSITY_DAYS if daily_5d else None
+
+    return {
+        "daily":       daily_display,
+        "frgn_sum":    frgn_sum,
+        "prsn_sum":    prsn_sum,
+        "prsn_5d_avg": prsn_5d_avg,   # 강도 계산용 5일 일평균
+    }
 
 
 # ─── KIS 이격도 + 거래대금 ────────────────────────────────
@@ -517,7 +543,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     investor_days = get_investor_days()
     weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
     liq_label     = fmt(MIN_LIQUIDITY_20D)
-    log(f"\n이격도({DISPARITY_PERIOD}일) + 거래대금(5/20일) + 투자자({investor_days}일) 수집 중...")
+    log(f"\n이격도({DISPARITY_PERIOD}일) + 거래대금(5/20일) + 투자자({investor_days}일 표시/{PRSN_INTENSITY_DAYS}일 강도) 수집 중...")
 
     results      = []
     liq_filtered = 0
@@ -525,7 +551,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         ticker     = c["ticker"]
         price_data = get_disparity_and_volume(ticker, token)
         disp        = price_data["disparity"]
-        vol_5d_avg  = price_data["vol_5d_avg"]
+        vol_5d_avg  = price_data["vol_5d_avg"]   # 5일 일평균 거래대금
         vol_20d_avg = price_data["vol_20d_avg"]
 
         if vol_20d_avg > 0 and vol_20d_avg < MIN_LIQUIDITY_20D:
@@ -533,12 +559,17 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             time.sleep(0.05)
             continue
 
-        investor  = get_investor_net_buy_daily(ticker, token, days=investor_days)
-        frgn_sum  = investor["frgn_sum"]
-        prsn_sum  = investor["prsn_sum"]
+        investor   = get_investor_net_buy_daily(ticker, token, display_days=investor_days)
+        frgn_sum   = investor["frgn_sum"]
+        prsn_sum   = investor["prsn_sum"]
+        prsn_5d_avg = investor["prsn_5d_avg"]   # 5일 일평균 개인 순매수
 
-        # 개인수급강도 = 개인순매수 합산 / 5일평균거래대금
-        prsn_intensity = (prsn_sum / vol_5d_avg) if vol_5d_avg > 0 else None
+        # 개인수급강도 = 개인순매수 5일 일평균 / 거래대금 5일 일평균
+        # 분자·분모 모두 5일 일평균으로 통일 → 비율이 의미있음
+        if prsn_5d_avg is not None and vol_5d_avg > 0:
+            prsn_intensity = prsn_5d_avg / vol_5d_avg
+        else:
+            prsn_intensity = None
 
         # 수급주체 태그
         subj_tags = []
@@ -592,7 +623,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
                 f"  🏢 시총: {cap_str}\n"
                 f"  💰 ETF유입: {fmt(r['inflow'])}  |  📊 이격도: {disp_str} {disp_icon}\n"
                 f"  👤 개인수급강도: {prsn_int_str}\n"
-                f"     (개인순매수 {investor_days}일 합산 / 5일평균거래대금)\n"
+                f"     (개인순매수 5일 일평균 / 거래대금 5일 일평균)\n"
                 f"{subj_str}"
                 f"{investor_str}\n"
                 f"{divider}\n\n"
