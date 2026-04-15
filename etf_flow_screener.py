@@ -1,17 +1,16 @@
 """
-ETF 수급 기반 종목 스크리너 v5.10
+ETF 수급 기반 종목 스크리너 v5.11
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-전략 스킴:
-  개인 자금 → ETF 유입 → PDF 역추적 → 개별종목 수급 파악
-  외국인 동반 수급 여부 확인 → 수급강도 측정
-
-v5.10 주요 설정:
-  - 기관 수급 제거 → 외국인 + 개인만 표시
-  - 수급강도 2개: ETF수급강도(ETF유입/5일평균) + 개인수급강도(개인순매수/5일평균)
-  - 정렬: ETF수급강도 내림차순
-  - 시총 1조 이상 필터 (MIN_MKTCAP)
-  - 20일 평균거래대금 200억 이상 필터 (MIN_LIQUIDITY_20D)
+변경 (v5.10 → v5.11):
+  - EXCLUDE_KEYWORDS 대폭 강화
+    기존: 채권, 국채 등 일부 키워드만
+    변경: 채권형/혼합형/통화형 ETF를 포괄하는 키워드 추가
+    추가 키워드: 국고채, 회사채, 하이일드, 크레딧, 금리, 듀레이션,
+                TLT, AGG, 통안채, 은행채, 특수채, 물가채, 10년, 30년,
+                혼합, 멀티에셋, 인컴, 배당성장, 배당귀족 (배당주 ETF 제외 목적)
+    단, "배당"만 단독으로는 제외 안 함 (주식형 배당 ETF 허용)
+  - 로그에 필터된 ETF 목록 출력 추가 (디버깅용)
 """
 
 import os
@@ -33,9 +32,9 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW  = 3_000_000_000     # 종목 최소 ETF 유입 기여액 (3억)
-MIN_LIQUIDITY_20D = 20_000_000_000    # 20일 평균거래대금 최소 기준 (200억)
-MIN_MKTCAP        = 1_000_000_000_000 # 시총 최소 기준 (1조)
+MIN_STOCK_INFLOW  = 3_000_000_000
+MIN_LIQUIDITY_20D = 20_000_000_000
+MIN_MKTCAP        = 1_000_000_000_000
 TOP_ETF_N         = 30
 CANDIDATE_N       = 30
 TOP_N             = 30
@@ -47,13 +46,41 @@ FLOW_INTENSITY_HI = 3.0
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
+# ─── ETF 제외 키워드 (강화) ───────────────────────────
+# 레버리지/인버스
 EXCLUDE_KEYWORDS = [
     "레버리지", "인버스", "2X", "3X", "-1X", "곱버스",
+
+    # 해외/지역
     "해외", "미국", "중국", "일본", "인도", "베트남", "나스닥", "S&P",
-    "채권", "국채", "달러", "금", "선물", "WTI", "유가", "원유",
-    "커버드콜", "covered", "프리미엄", "위클리",
+    "유럽", "신흥국", "이머징", "글로벌", "아시아", "홍콩", "대만",
+    "브라질", "러시아", "인도네시아", "멕시코",
+
+    # 채권/금리 관련 (대폭 강화)
+    "채권", "국채", "국고채", "회사채", "하이일드", "크레딧",
+    "금리", "듀레이션", "통안채", "은행채", "특수채", "물가채",
+    "10년", "30년", "3년", "5년", "단기채", "중기채", "장기채",
+    "TLT", "AGG", "IEF", "LQD", "HYG",
+    "우량채", "혼합채", "채권혼합",
+
+    # 통화/원자재
+    "달러", "엔화", "위안", "유로", "환헤지", "환노출",
+    "금", "은", "구리", "선물", "WTI", "유가", "원유", "천연가스",
+    "농산물", "원자재", "상품",
+
+    # 파생/구조화
+    "커버드콜", "covered", "프리미엄", "위클리", "옵션",
+    "버퍼", "테일헤지",
+
+    # 단기금융
     "머니마켓", "MMF", "단기", "CD금리", "KOFR", "SOFR",
-    "부동산", "리츠", "REIT",
+    "CP", "콜", "RP",
+
+    # 부동산/인프라
+    "부동산", "리츠", "REIT", "인프라",
+
+    # 혼합/멀티에셋
+    "혼합", "멀티에셋", "인컴", "TDF",
 ]
 
 
@@ -176,18 +203,26 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict
     if not code_col or not name_col:
         return {}
 
-    etf_info = {}
+    etf_info    = {}
+    excluded    = []
     for _, row in df.iterrows():
         try:
             ticker = str(row[code_col]).strip().zfill(6)
             name   = str(row[name_col]).strip()
             mktcap = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
-            if len(ticker) == 6 and ticker.isdigit() and is_valid_etf(name):
-                etf_info[ticker] = {"name": name, "mktcap": mktcap}
+            if len(ticker) == 6 and ticker.isdigit():
+                if is_valid_etf(name):
+                    etf_info[ticker] = {"name": name, "mktcap": mktcap}
+                else:
+                    excluded.append(name)
         except:
             continue
 
-    log(f"  → 유효 ETF {len(etf_info)}개")
+    log(f"  → 유효 ETF {len(etf_info)}개 (제외: {len(excluded)}개)")
+    # 디버깅: 제외된 ETF 중 채권 관련 상위 10개 출력
+    bond_excluded = [n for n in excluded if any(kw in n for kw in ["국고채", "채권", "금리", "10년", "30년"])]
+    if bond_excluded:
+        log(f"  → 채권 관련 제외 예시: {bond_excluded[:5]}")
     return etf_info
 
 
@@ -262,12 +297,6 @@ def get_etf_components_kis(etf_ticker: str, token: str) -> list:
 # ─── KIS 투자자별 순매수 - 외국인 + 개인 일자별 ──────────
 
 def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
-    """
-    FHKST01010900 - output[0]=당일, output[1]=전일 ...
-    외국인(frgn_ntby_tr_pbmn) + 개인(prsn_ntby_tr_pbmn) 수집
-    둘 다 0이면 장 미개장 → 제외
-    단위: 백만원 × 1,000,000 = 원
-    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-investor", "FHKST01010900",
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token,
@@ -297,10 +326,6 @@ def get_investor_net_buy_daily(ticker: str, token: str, days: int) -> dict:
 # ─── KIS 이격도 + 거래대금 ────────────────────────────────
 
 def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> dict:
-    """
-    FHKST01010400 - 이격도 + 거래대금 단일 호출
-    거래대금: output[1:]부터 사용 (output[0]=당일 acml_vol=0 이슈 제거)
-    """
     data = kis_get(
         "/uapi/domestic-stock/v1/quotations/inquire-daily-price", "FHKST01010400",
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker,
@@ -352,7 +377,6 @@ def fmt_flow(n: float) -> str:
 
 
 def fmt_investor_daily(daily: list, frgn_sum: float, prsn_sum: float) -> str:
-    """외국인 + 개인 일자별 표시"""
     if not daily:
         return "  외인/개인: 데이터 없음"
     rows = list(reversed(daily))
@@ -404,7 +428,7 @@ def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
 
 def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) -> bool:
     log("─" * 40)
-    log("[ANALYZE] ETF 수급 스크리너 v5.10 분석")
+    log("[ANALYZE] ETF 수급 스크리너 v5.11 분석")
 
     cutoff = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
     cache  = load_aum_cache()
@@ -445,9 +469,10 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     )[:TOP_ETF_N]
 
     log(f"상위 {len(top_etfs)}개 집중형 ETF 선정")
-    for i, (t, v) in enumerate(top_etfs[:5], 1):
-        cnt = last_data.get(t, {}).get("cnt", "?")
-        log(f"  {i}. {etf_info.get(t, {}).get('name', t)} ({t}) | 구성{cnt}종목 | +{fmt(v)}")
+    for i, (t, v) in enumerate(top_etfs[:10], 1):
+        cnt  = last_data.get(t, {}).get("cnt", "?")
+        name = etf_info.get(t, {}).get("name", t)
+        log(f"  {i}. {name} ({t}) | 구성{cnt}종목 | +{fmt(v)}")
 
     if not top_etfs:
         log("선정된 ETF 없음")
@@ -471,7 +496,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     if pdf_ok == 0:
         return False
 
-    # 시총 1조 이상 + ETF유입 최소금액 필터
     candidates   = []
     mktcap_filtered = 0
     for ticker, inflow in stock_inflow.items():
@@ -513,17 +537,12 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             time.sleep(0.05)
             continue
 
-        # ETF수급강도 = ETF유입기여 / 5일평균거래대금
-        etf_intensity = (c["inflow"] / vol_5d_avg) if vol_5d_avg > 0 else 0.0
-
+        etf_intensity  = (c["inflow"] / vol_5d_avg) if vol_5d_avg > 0 else 0.0
         investor = get_investor_net_buy_daily(ticker, token, days=investor_days)
         frgn_sum = investor["frgn_sum"]
         prsn_sum = investor["prsn_sum"]
-
-        # 개인수급강도 = 개인순매수 합산 / 5일평균거래대금
         prsn_intensity = (prsn_sum / vol_5d_avg) if vol_5d_avg > 0 else 0.0
 
-        # 수급주체 태그
         subj_tags = []
         if frgn_sum > 0:
             subj_tags.append("🌐외국인↑")
@@ -544,8 +563,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         time.sleep(0.15)
 
     log(f"  → 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})")
-
-    # ETF수급강도 내림차순 정렬
     results.sort(key=lambda x: x["etf_intensity"], reverse=True)
     top = results[:TOP_N]
     log(f"\n  → 최종 선별: {len(top)}개")
@@ -553,7 +570,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     # ── 텔레그램 발송 ─────────────────────────────────────
     divider = "─" * 20
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.10</b>\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.11</b>\n"
     msg += f"🗓 {now}  |  분석: {period_str} ({len(available_dates)}일)\n"
     msg += f"📌 집중형 ETF {len(top_etfs)}개 순유입 → <b>{len(top)}개 종목</b>\n"
     msg += f"💧 유동성 {liq_label} 미만 제외 {liq_filtered}개  |  시총 1조 미만 제외 {mktcap_filtered}개\n"
@@ -599,7 +616,7 @@ def main():
 
     base_date = get_recent_business_day(1)
     log("=" * 50)
-    log(f"ETF 수급 스크리너 v5.10 | 기준일: {base_date}")
+    log(f"ETF 수급 스크리너 v5.11 | 기준일: {base_date}")
     log("=" * 50)
 
     log("KIS 토큰 발급 중...")
