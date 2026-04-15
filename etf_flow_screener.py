@@ -1,21 +1,28 @@
 """
-ETF 수급 기반 종목 스크리너 v5.13
+ETF 수급 기반 종목 스크리너 v5.15
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
 전략 스킴:
   개인 자금 → ETF 유입 → PDF 역추적 → 개별종목 수급 파악
-  외국인 동반 수급 여부 확인 → 수급강도 측정
+  ETF수급강도로 정렬, 외국인/개인 수급강도를 방향 시각화
 
-수급강도 지표 (모두 % 단위):
-  ETF수급강도(%)  = ETF유입기여 / 거래대금 5일 일평균 × 100
-                   → 미래에셋 원래 스킴, ETF 수급 압력 측정
-  개인수급강도(%) = 개인순매수 5일 일평균 / 거래대금 5일 일평균 × 100
-                   → 개인이 직접 사는 강도 측정
+수급강도 지표 (모두 % 단위, 5일 일평균 / 거래대금 5일 일평균 × 100):
+  ⚡ ETF수급강도(%)    = ETF유입기여 / 거래대금 5일 일평균 × 100   ← 정렬 기준
+  🌐 외국인수급강도(%) = 외국인순매수 5일 일평균 / 거래대금 5일 일평균 × 100
+  👤 개인수급강도(%)   = 개인순매수 5일 일평균 / 거래대금 5일 일평균 × 100
 
-변경 (v5.12 → v5.13):
-  - 두 수급강도 모두 % 단위로 통일 (소수점 1자리)
-  - ETF수급강도 복원 (v5.12에서 제거됐던 것)
-  - 정렬 기준: ETF수급강도 내림차순 (미래에셋 원래 스킴 기준)
+수급 케이스 태그:
+  🔥 트리플 동반 : ETF↑ 외국인↑ 개인↑
+  📈 외국인 주도 : ETF↑ 외국인↑ 개인↓
+  👤 개인 주도   : ETF↑ 외국인↓ 개인↑
+  ⚡ ETF 단독    : ETF↑ 외국인↓ 개인↓
+
+변경 (v5.13 → v5.15):
+  - 정렬: ETF수급강도 단독 내림차순
+  - 외국인수급강도 추가
+  - 수급 케이스 자동 태그
+  - 시총 필터 제거
+  - 거래대금 필터 200억 → 500억 (실제 진입 가능 기준)
 """
 
 import os
@@ -37,17 +44,16 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW    = 3_000_000_000
-MIN_LIQUIDITY_20D   = 20_000_000_000
-MIN_MKTCAP          = 1_000_000_000_000
-TOP_ETF_N           = 30
-CANDIDATE_N         = 30
-TOP_N               = 30
-LOOKBACK_DAYS       = 7
-DISPARITY_PERIOD    = 20
-DISPARITY_THRESH    = -2.0
-MAX_ETF_STOCKS      = 30
-PRSN_INTENSITY_DAYS = 5   # 개인수급강도 계산 고정 기간
+MIN_STOCK_INFLOW  = 3_000_000_000     # ETF 편입 종목별 최소 유입 금액
+MIN_LIQUIDITY_20D = 50_000_000_000    # 20일평균거래대금 500억 (시총 필터 대신)
+TOP_ETF_N         = 30
+CANDIDATE_N       = 30
+TOP_N             = 30
+LOOKBACK_DAYS     = 7
+DISPARITY_PERIOD  = 20
+DISPARITY_THRESH  = -2.0
+MAX_ETF_STOCKS    = 30
+INTENSITY_DAYS    = 5                 # 수급강도 계산 고정 기간 (분자/분모 통일)
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
@@ -288,7 +294,7 @@ def get_investor_net_buy_daily(ticker: str, token: str, display_days: int) -> di
     """
     FHKST01010900 - output[0]=당일, output[1]=전일 ...
     - display_days: 표시용 (요일 기준 N영업일)
-    - 강도 계산용 5일치는 prsn_5d_avg에 별도 저장
+    - 강도 계산: INTENSITY_DAYS(5일) 일평균 → 분자/분모 기준 통일
     - frgn==0 and prsn==0 동시 → 장 미개장 → 제외
     - 단위: 백만원 × 1,000,000 = 원
     """
@@ -297,7 +303,7 @@ def get_investor_net_buy_daily(ticker: str, token: str, display_days: int) -> di
         {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}, token,
     )
     output = data.get("output", [])
-    collect_days = max(display_days, PRSN_INTENSITY_DAYS)
+    collect_days = max(display_days, INTENSITY_DAYS)
 
     daily_all = []
     for row in output[:collect_days]:
@@ -312,18 +318,21 @@ def get_investor_net_buy_daily(ticker: str, token: str, display_days: int) -> di
         except:
             continue
 
+    # 표시용
     daily_display = daily_all[:display_days]
     frgn_sum = sum(r["frgn"] for r in daily_display)
     prsn_sum = sum(r["prsn"] for r in daily_display)
 
-    # 강도 계산용: 5일 일평균
-    daily_5d    = daily_all[:PRSN_INTENSITY_DAYS]
-    prsn_5d_avg = sum(r["prsn"] for r in daily_5d) / PRSN_INTENSITY_DAYS if daily_5d else None
+    # 강도 계산용: 5일 일평균 (분자/분모 기준 통일)
+    daily_5d    = daily_all[:INTENSITY_DAYS]
+    frgn_5d_avg = sum(r["frgn"] for r in daily_5d) / INTENSITY_DAYS if daily_5d else None
+    prsn_5d_avg = sum(r["prsn"] for r in daily_5d) / INTENSITY_DAYS if daily_5d else None
 
     return {
         "daily":       daily_display,
         "frgn_sum":    frgn_sum,
         "prsn_sum":    prsn_sum,
+        "frgn_5d_avg": frgn_5d_avg,
         "prsn_5d_avg": prsn_5d_avg,
     }
 
@@ -332,7 +341,7 @@ def get_investor_net_buy_daily(ticker: str, token: str, display_days: int) -> di
 
 def get_disparity_and_volume(ticker: str, token: str, n: int = DISPARITY_PERIOD) -> dict:
     """
-    FHKST01010400 - 이격도 + 거래대금 단일 호출
+    FHKST01010400 - 이격도 + 거래대금
     거래대금 = stck_clpr × acml_vol (.replace(",","") 필수)
     output[1:]부터 사용 (output[0]=당일 acml_vol=0 이슈)
     """
@@ -392,11 +401,32 @@ def fmt_flow(n: float) -> str:
 
 
 def fmt_pct(v) -> str:
-    """수급강도 % 포맷 (None이면 N/A)"""
     if v is None:
         return "N/A"
     sign = "+" if v >= 0 else ""
     return f"{sign}{v:.1f}%"
+
+
+def get_case_tag(etf_pct, frgn_pct, prsn_pct) -> str:
+    """
+    수급 케이스 자동 태그
+    🔥 트리플 동반 : 외국인↑ + 개인↑
+    📈 외국인 주도 : 외국인↑ + 개인↓
+    👤 개인 주도   : 외국인↓ + 개인↑
+    ⚡ ETF 단독    : 외국인↓ + 개인↓
+    """
+    if etf_pct is None:
+        return ""
+    frgn_up = frgn_pct is not None and frgn_pct > 0
+    prsn_up = prsn_pct is not None and prsn_pct > 0
+    if frgn_up and prsn_up:
+        return "🔥 트리플 동반"
+    elif frgn_up:
+        return "📈 외국인 주도"
+    elif prsn_up:
+        return "👤 개인 주도"
+    else:
+        return "⚡ ETF 단독"
 
 
 def fmt_investor_daily(daily: list, frgn_sum: float, prsn_sum: float) -> str:
@@ -451,7 +481,7 @@ def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
 
 def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) -> bool:
     log("─" * 40)
-    log("[ANALYZE] ETF 수급 스크리너 v5.13 분석")
+    log("[ANALYZE] ETF 수급 스크리너 v5.15 분석")
 
     cutoff = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
     cache  = load_aum_cache()
@@ -519,32 +549,28 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     if pdf_ok == 0:
         return False
 
-    candidates   = []
-    mktcap_filtered = 0
+    # 후보 필터링 (시총 필터 제거)
+    candidates = []
     for ticker, inflow in stock_inflow.items():
         if inflow < MIN_STOCK_INFLOW:
             continue
         info = stock_info.get(ticker, {})
         if not info.get("name"):
             continue
-        mktcap = info.get("mktcap", 0)
-        if mktcap < MIN_MKTCAP:
-            mktcap_filtered += 1
-            continue
         candidates.append({
             "ticker": ticker,
             "name":   info["name"],
             "inflow": inflow,
-            "mktcap": mktcap,
+            "mktcap": info.get("mktcap", 0),
         })
-    log(f"  → 시총 {fmt(MIN_MKTCAP)} 미만 제외: {mktcap_filtered}개 | 후보: {len(candidates)}개")
+    log(f"  → 후보: {len(candidates)}개 (시총 필터 없음)")
     candidates.sort(key=lambda x: x["inflow"], reverse=True)
     top_candidates = candidates[:CANDIDATE_N]
 
     investor_days = get_investor_days()
     weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
     liq_label     = fmt(MIN_LIQUIDITY_20D)
-    log(f"\n이격도({DISPARITY_PERIOD}일) + 거래대금(5/20일) + 투자자({investor_days}일 표시/{PRSN_INTENSITY_DAYS}일 강도) 수집 중...")
+    log(f"\n이격도 + 거래대금 + 투자자({investor_days}일) 수집 중...")
 
     results      = []
     liq_filtered = 0
@@ -552,59 +578,61 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         ticker     = c["ticker"]
         price_data = get_disparity_and_volume(ticker, token)
         disp        = price_data["disparity"]
-        vol_5d_avg  = price_data["vol_5d_avg"]   # 5일 일평균 거래대금
+        vol_5d_avg  = price_data["vol_5d_avg"]
         vol_20d_avg = price_data["vol_20d_avg"]
 
+        # 거래대금 500억 필터
         if vol_20d_avg > 0 and vol_20d_avg < MIN_LIQUIDITY_20D:
             liq_filtered += 1
             time.sleep(0.05)
             continue
 
-        # ETF수급강도(%) = ETF유입기여 / 거래대금 5일 일평균 × 100
-        etf_intensity_pct = (c["inflow"] / vol_5d_avg * 100) if vol_5d_avg > 0 else None
+        # ⚡ ETF수급강도(%) = ETF유입기여 / 거래대금 5일 일평균 × 100
+        etf_pct = (c["inflow"] / vol_5d_avg * 100) if vol_5d_avg > 0 else None
 
         investor    = get_investor_net_buy_daily(ticker, token, display_days=investor_days)
-        frgn_sum    = investor["frgn_sum"]
-        prsn_sum    = investor["prsn_sum"]
+        frgn_5d_avg = investor["frgn_5d_avg"]
         prsn_5d_avg = investor["prsn_5d_avg"]
 
-        # 개인수급강도(%) = 개인순매수 5일 일평균 / 거래대금 5일 일평균 × 100
-        prsn_intensity_pct = (prsn_5d_avg / vol_5d_avg * 100) if (prsn_5d_avg is not None and vol_5d_avg > 0) else None
+        # 🌐 외국인수급강도(%)
+        frgn_pct = (frgn_5d_avg / vol_5d_avg * 100) if (frgn_5d_avg is not None and vol_5d_avg > 0) else None
 
-        # 수급주체 태그
-        subj_tags = []
-        if frgn_sum > 0:
-            subj_tags.append("🌐외국인↑")
-        if prsn_sum > 0:
-            subj_tags.append("👤개인↑")
+        # 👤 개인수급강도(%)
+        prsn_pct = (prsn_5d_avg / vol_5d_avg * 100) if (prsn_5d_avg is not None and vol_5d_avg > 0) else None
+
+        case_tag = get_case_tag(etf_pct, frgn_pct, prsn_pct)
 
         results.append({
             **c,
-            "investor":           investor,
-            "frgn_sum":           frgn_sum,
-            "prsn_sum":           prsn_sum,
-            "disp":               disp,
-            "vol_5d_avg":         vol_5d_avg,
-            "etf_intensity_pct":  etf_intensity_pct,
-            "prsn_intensity_pct": prsn_intensity_pct,
-            "subj_tags":          " ".join(subj_tags),
+            "investor":   investor,
+            "frgn_sum":   investor["frgn_sum"],
+            "prsn_sum":   investor["prsn_sum"],
+            "disp":       disp,
+            "vol_5d_avg": vol_5d_avg,
+            "etf_pct":    etf_pct,
+            "frgn_pct":   frgn_pct,
+            "prsn_pct":   prsn_pct,
+            "case_tag":   case_tag,
         })
         time.sleep(0.15)
 
     log(f"  → 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})")
 
-    # ETF수급강도 내림차순 정렬 (None은 뒤로)
-    results.sort(key=lambda x: x["etf_intensity_pct"] if x["etf_intensity_pct"] is not None else -999, reverse=True)
+    # ETF수급강도 내림차순 정렬
+    results.sort(key=lambda x: x["etf_pct"] if x["etf_pct"] is not None else -999, reverse=True)
     top = results[:TOP_N]
     log(f"\n  → 최종 선별: {len(top)}개")
+
+    for r in top[:5]:
+        log(f"  {r['name']} | {r['case_tag']} | ETF {fmt_pct(r['etf_pct'])} | 외국인 {fmt_pct(r['frgn_pct'])} | 개인 {fmt_pct(r['prsn_pct'])}")
 
     # ── 텔레그램 발송 ─────────────────────────────────────
     divider = "─" * 20
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.13</b>\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.15</b>\n"
     msg += f"🗓 {now}  |  분석: {period_str} ({len(available_dates)}일)\n"
     msg += f"📌 집중형 ETF {len(top_etfs)}개 순유입 → <b>{len(top)}개 종목</b>\n"
-    msg += f"💧 유동성 {liq_label} 미만 제외 {liq_filtered}개  |  시총 1조 미만 제외 {mktcap_filtered}개\n"
+    msg += f"💧 거래대금 {liq_label} 미만 제외 {liq_filtered}개  (시총 필터 없음)\n"
     msg += f"외인/개인: {weekday_name}요일 기준 {investor_days}영업일\n"
     msg += "━" * 24 + "\n\n"
 
@@ -612,22 +640,20 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         msg += "조건 충족 종목이 없습니다.\n"
     else:
         for i, r in enumerate(top, 1):
-            cap_str      = fmt(r["mktcap"])
-            disp_str     = f"{r['disp']:+.1f}%" if r["disp"] != 0 else "N/A"
-            disp_icon    = "📉" if r["disp"] < DISPARITY_THRESH else ("📈" if r["disp"] > 2.0 else "")
-            etf_pct_str  = fmt_pct(r["etf_intensity_pct"])
-            prsn_pct_str = fmt_pct(r["prsn_intensity_pct"])
-            subj_str     = f"  수급주체: {r['subj_tags']}\n" if r["subj_tags"] else ""
-            investor_str = fmt_investor_daily(r["investor"]["daily"], r["frgn_sum"], r["prsn_sum"])
+            cap_str   = fmt(r["mktcap"]) if r["mktcap"] else "N/A"
+            disp_str  = f"{r['disp']:+.1f}%" if r["disp"] != 0 else "N/A"
+            disp_icon = "📉" if r["disp"] < DISPARITY_THRESH else ("📈" if r["disp"] > 2.0 else "")
+            inv_str   = fmt_investor_daily(r["investor"]["daily"], r["frgn_sum"], r["prsn_sum"])
 
             msg += (
-                f"<b>{i}. {r['name']} ({r['ticker']})</b>\n"
-                f"  🏢 시총: {cap_str}\n"
-                f"  💰 ETF유입: {fmt(r['inflow'])}  |  📊 이격도: {disp_str} {disp_icon}\n"
-                f"  ⚡ ETF수급강도: {etf_pct_str}  👤 개인수급강도: {prsn_pct_str}\n"
-                f"     (ETF유입·개인순매수 / 거래대금 5일 일평균)\n"
-                f"{subj_str}"
-                f"{investor_str}\n"
+                f"<b>{i}. {r['name']} ({r['ticker']})</b>  {r['case_tag']}\n"
+                f"  🏢 시총: {cap_str}  |  📊 이격도: {disp_str} {disp_icon}\n"
+                f"  💰 ETF유입: {fmt(r['inflow'])}\n"
+                f"  ⚡ ETF:  {fmt_pct(r['etf_pct'])}\n"
+                f"  🌐 외국인: {fmt_pct(r['frgn_pct'])}\n"
+                f"  👤 개인:  {fmt_pct(r['prsn_pct'])}\n"
+                f"     (5일 일평균 순매수 / 5일 일평균 거래대금)\n"
+                f"{inv_str}\n"
                 f"{divider}\n\n"
             )
 
@@ -647,7 +673,7 @@ def main():
 
     base_date = get_recent_business_day(1)
     log("=" * 50)
-    log(f"ETF 수급 스크리너 v5.13 | 기준일: {base_date}")
+    log(f"ETF 수급 스크리너 v5.15 | 기준일: {base_date}")
     log("=" * 50)
 
     log("KIS 토큰 발급 중...")
