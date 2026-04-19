@@ -2,16 +2,11 @@
 ETF 수급 기반 종목 스크리너 v5.17
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경 (v5.17 이전 → v5.17):
-  - MIN_LIQUIDITY_20D: 500억 → 300억
-  - CANDIDATE_N: 30 → 50
-  - MAX_ETF_STOCKS 유지 (30종목)
-
-버그수정:
-  - stock_info 0개여도 ETF 수집은 계속 진행
-    (기존: stock_info 0개 → "ETF 유니버스 수집 실패" 오판 종료)
-  - get_stock_info_bulk 실패 시 재시도 1회 추가
-  - etf_info 수집 성공 / stock_info 수집 실패를 독립적으로 체크
+버그수정 (v5.17):
+  - KRX API fallback: etf_info 0개 시 최대 5영업일 전까지 순차 재시도
+  - stock_info는 fallback된 실제 날짜 기준으로 수집
+  - stock_info 0개여도 ETF 수집과 독립적으로 처리 (PDF 종목명 폴백)
+  - get_etf_universe가 (etf_info, actual_date) 튜플 반환
 """
 
 import os
@@ -36,14 +31,15 @@ AUM_CACHE_FILE = "etf_aum_cache.json"
 MIN_STOCK_INFLOW    = 3_000_000_000
 MIN_LIQUIDITY_20D   = 30_000_000_000  # 300억
 TOP_ETF_N           = 30
-CANDIDATE_N         = 50              # 후보 50개
+CANDIDATE_N         = 50
 TOP_N               = 30
 LOOKBACK_DAYS       = 7
 DISPARITY_PERIOD    = 20
 DISPARITY_THRESH    = -2.0
-MAX_ETF_STOCKS      = 30              # 집중형 ETF 기준 유지
+MAX_ETF_STOCKS      = 30
 INTENSITY_DAYS      = 5
 ETF_POOL_RATIO      = 0.5
+KRX_MAX_FALLBACK    = 5   # KRX API 실패 시 최대 며칠 전까지 fallback
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
@@ -166,55 +162,71 @@ def kis_get(path: str, tr_id: str, params: dict, token: str) -> dict:
 
 # ─── KRX API ─────────────────────────────────────────
 
-def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict:
-    log("ETF 유니버스 수집 중...")
-    df = pd.DataFrame()
-    for attempt in range(retry + 1):
+def get_etf_universe(client: KRXOpenAPI, base_date: str):
+    """
+    ETF 유니버스 수집
+    - 실패 시 최대 KRX_MAX_FALLBACK 영업일 전까지 순차 fallback
+    - 반환: (etf_info dict, actual_date str)
+    """
+    log(f"ETF 유니버스 수집 중... (기준일: {base_date})")
+
+    # 시도할 날짜 목록 생성 (기준일 포함, 최대 fallback일수만큼)
+    dates_to_try = [base_date]
+    dt = datetime.strptime(base_date, "%Y%m%d")
+    for _ in range(KRX_MAX_FALLBACK - 1):
+        dt -= timedelta(days=1)
+        while dt.weekday() >= 5:
+            dt -= timedelta(days=1)
+        dates_to_try.append(dt.strftime("%Y%m%d"))
+
+    for try_date in dates_to_try:
+        if try_date != base_date:
+            log(f"  → fallback: {try_date} 시도 중...")
         try:
-            df = to_df(client.get_etf_daily_trade(bas_dd=base_date))
-            if not df.empty:
-                break
+            df = to_df(client.get_etf_daily_trade(bas_dd=try_date))
+            if df.empty:
+                continue
+
+            code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
+            name_col = find_col(df, ["ISU_NM"])
+            cap_col  = find_col(df, ["MKTCAP"])
+            if not code_col or not name_col:
+                continue
+
+            etf_info = {}
+            excluded = []
+            for _, row in df.iterrows():
+                try:
+                    ticker = str(row[code_col]).strip().zfill(6)
+                    name   = str(row[name_col]).strip()
+                    mktcap = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
+                    if len(ticker) == 6 and ticker.isdigit():
+                        if is_valid_etf(name):
+                            etf_info[ticker] = {"name": name, "mktcap": mktcap}
+                        else:
+                            excluded.append(name)
+                except:
+                    continue
+
+            if etf_info:
+                log(f"  → 유효 ETF {len(etf_info)}개 (제외: {len(excluded)}개) [기준일: {try_date}]")
+                bond_ex = [n for n in excluded if any(kw in n for kw in ["국고채", "채권", "금리", "10년", "30년"])]
+                if bond_ex:
+                    log(f"  → 채권 관련 제외 예시: {bond_ex[:5]}")
+                return etf_info, try_date  # 실제 사용된 날짜도 반환
         except Exception as e:
-            log(f"  → ETF 조회 오류 (시도 {attempt+1}/{retry+1}): {e}")
-            if attempt < retry:
-                log("  → 5초 후 재시도...")
-                time.sleep(5)
-            else:
-                return {}
-
-    code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
-    name_col = find_col(df, ["ISU_NM"])
-    cap_col  = find_col(df, ["MKTCAP"])
-    if not code_col or not name_col:
-        return {}
-
-    etf_info = {}
-    excluded = []
-    for _, row in df.iterrows():
-        try:
-            ticker = str(row[code_col]).strip().zfill(6)
-            name   = str(row[name_col]).strip()
-            mktcap = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
-            if len(ticker) == 6 and ticker.isdigit():
-                if is_valid_etf(name):
-                    etf_info[ticker] = {"name": name, "mktcap": mktcap}
-                else:
-                    excluded.append(name)
-        except:
+            log(f"  → ETF 조회 오류 ({try_date}): {e}")
             continue
 
-    log(f"  → 유효 ETF {len(etf_info)}개 (제외: {len(excluded)}개)")
-    bond_ex = [n for n in excluded if any(kw in n for kw in ["국고채", "채권", "금리", "10년", "30년"])]
-    if bond_ex:
-        log(f"  → 채권 관련 제외 예시: {bond_ex[:5]}")
-    return etf_info
+    log("  → ETF 유니버스 수집 실패 (모든 fallback 소진)")
+    return {}, base_date
 
 
 def get_stock_info_bulk(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict:
     """
     주식 종목 정보 수집 (KOSPI + KOSDAQ)
     - 0개 수집 시 retry 1회 (5초 대기 후)
-    - 실패해도 빈 dict 반환 (ETF 수집과 독립적으로 처리)
+    - 실패해도 빈 dict 반환 (ETF 수집과 독립적)
     """
     stock_info = {}
     for attempt in range(retry + 1):
@@ -470,7 +482,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     log("─" * 40)
     log("[ANALYZE] ETF 수급 스크리너 v5.17 분석")
 
-    # stock_info 0개면 경고만 찍고 계속 (ETF PDF에서 종목명 사용)
     if not stock_info:
         log("  ⚠️ 주식 종목 정보 없음 → ETF PDF 종목명으로 대체")
 
@@ -534,7 +545,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         total_wt = sum(h["weight"] for h in holdings)
         for h in holdings:
             wt = h["weight"] / total_wt if total_wt > 0 else 0
-            # PDF에서 종목명도 같이 저장 (stock_info 없을 때 대비)
             if h["ticker"] not in stock_inflow:
                 stock_inflow[h["ticker"]] = {"inflow": 0.0, "name_pdf": h["name"]}
             stock_inflow[h["ticker"]]["inflow"] += inflow * wt
@@ -548,16 +558,10 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         inflow = data["inflow"]
         if inflow < MIN_STOCK_INFLOW:
             continue
-        # stock_info 우선, 없으면 PDF 종목명 사용
         info   = stock_info.get(ticker, {})
         name   = info.get("name") or data.get("name_pdf") or ticker
         mktcap = info.get("mktcap", 0)
-        candidates.append({
-            "ticker": ticker,
-            "name":   name,
-            "inflow": inflow,
-            "mktcap": mktcap,
-        })
+        candidates.append({"ticker": ticker, "name": name, "inflow": inflow, "mktcap": mktcap})
     log(f"  → 후보: {len(candidates)}개")
     candidates.sort(key=lambda x: x["inflow"], reverse=True)
     top_candidates = candidates[:CANDIDATE_N]
@@ -582,16 +586,12 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             continue
 
         etf_pct = (c["inflow"] / vol_5d_avg * 100) if vol_5d_avg > 0 else None
-
         investor    = get_investor_net_buy_daily(ticker, token, display_days=investor_days)
         frgn_5d_avg = investor["frgn_5d_avg"]
         prsn_5d_avg = investor["prsn_5d_avg"]
 
         frgn_pct = (frgn_5d_avg / vol_5d_avg * 100) if (frgn_5d_avg is not None and vol_5d_avg > 0) else None
         prsn_pct = (prsn_5d_avg / vol_5d_avg * 100) if (prsn_5d_avg is not None and vol_5d_avg > 0) else None
-
-        flow_score = calc_flow_score(frgn_pct, prsn_pct)
-        case_tag   = get_case_tag(frgn_pct, prsn_pct)
 
         results.append({
             **c,
@@ -603,28 +603,24 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             "etf_pct":    etf_pct,
             "frgn_pct":   frgn_pct,
             "prsn_pct":   prsn_pct,
-            "flow_score": flow_score,
-            "case_tag":   case_tag,
+            "flow_score": calc_flow_score(frgn_pct, prsn_pct),
+            "case_tag":   get_case_tag(frgn_pct, prsn_pct),
         })
         time.sleep(0.15)
 
     log(f"  → 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})")
 
-    # ── 2단계 정렬 ────────────────────────────────────────
     valid = [r for r in results if r["etf_pct"] is not None]
     valid.sort(key=lambda x: x["etf_pct"], reverse=True)
-
     pool_size = max(1, int(len(valid) * ETF_POOL_RATIO))
     etf_pool  = valid[:pool_size]
     log(f"\n  [1단계] ETF수급강도 전체 {len(valid)}개 → 상위 {pool_size}개 후보 풀 ({int(ETF_POOL_RATIO*100)}%)")
-
     etf_pool.sort(key=lambda x: x["flow_score"], reverse=True)
     top = etf_pool[:TOP_N]
     log(f"\n  [2단계] 수급점수 정렬 → 최종 {len(top)}개")
     for r in top[:5]:
         log(f"    {r['name']} | {r['case_tag']} | 수급점수 {fmt_pct(r['flow_score'])} (외국인 {fmt_pct(r['frgn_pct'])} / 개인 {fmt_pct(r['prsn_pct'])})")
 
-    # ── 텔레그램 발송 ─────────────────────────────────────
     divider = "─" * 20
     now = datetime.now().strftime("%Y/%m/%d %H:%M")
     msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.17</b>\n"
@@ -643,7 +639,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             disp_str  = f"{r['disp']:+.1f}%" if r["disp"] != 0 else "N/A"
             disp_icon = "📉" if r["disp"] < DISPARITY_THRESH else ("📈" if r["disp"] > 2.0 else "")
             inv_str   = fmt_investor_daily(r["investor"]["daily"], r["frgn_sum"], r["prsn_sum"])
-
             msg += (
                 f"<b>{i}. {r['name']} ({r['ticker']})</b>  {r['case_tag']}\n"
                 f"  🏢 시총: {cap_str}  |  📊 이격도: {disp_str} {disp_icon}\n"
@@ -683,21 +678,22 @@ def main():
     krx = KRXOpenAPI(api_key=KRX_API_KEY, rate_limit=5, per_seconds=1)
 
     log("\nKRX 데이터 수집 중...")
-    etf_info   = get_etf_universe(krx, base_date, retry=1)
-    stock_info = get_stock_info_bulk(krx, base_date, retry=1)  # 실패해도 계속
+    # fallback 포함 ETF 유니버스 수집 → 실제 사용된 날짜 반환
+    etf_info, actual_date = get_etf_universe(krx, base_date)
+    stock_info = get_stock_info_bulk(krx, actual_date, retry=1)
 
-    # ETF 유니버스만 체크 (stock_info는 독립적으로 처리)
     if not etf_info:
         log("ETF 유니버스 수집 실패. 종료.")
         return
 
-    collect_ok = run_collect(etf_info, token, base_date)
+    # 실제 데이터 날짜로 COLLECT
+    collect_ok = run_collect(etf_info, token, actual_date)
     if not collect_ok:
         log("COLLECT 실패. ANALYZE 스킵.")
         return
 
     log("")
-    run_analyze(etf_info, stock_info, token, base_date)
+    run_analyze(etf_info, stock_info, token, actual_date)
     log("\n완료!")
 
 
