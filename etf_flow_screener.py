@@ -2,14 +2,16 @@
 ETF 수급 기반 종목 스크리너 v5.17
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-2단계 정렬 전략:
-  1단계: ETF수급강도 상위 50%로 후보 풀 선정
-  2단계: 수급점수(외국인50% + 개인50%) 내림차순 최종 정렬
+변경 (v5.17 이전 → v5.17):
+  - MIN_LIQUIDITY_20D: 500억 → 300억
+  - CANDIDATE_N: 30 → 50
+  - MAX_ETF_STOCKS 유지 (30종목)
 
-변경 (v5.16 → v5.17):
-  - MIN_LIQUIDITY_20D: 500억 → 300억 (거래대금 필터 완화)
-  - CANDIDATE_N: 30 → 50 (후보 종목 수 확대)
-  - MAX_ETF_STOCKS 유지 (30종목, ETF 수급 임팩트 보존)
+버그수정:
+  - stock_info 0개여도 ETF 수집은 계속 진행
+    (기존: stock_info 0개 → "ETF 유니버스 수집 실패" 오판 종료)
+  - get_stock_info_bulk 실패 시 재시도 1회 추가
+  - etf_info 수집 성공 / stock_info 수집 실패를 독립적으로 체크
 """
 
 import os
@@ -31,17 +33,17 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW    = 3_000_000_000   # ETF 편입 종목별 최소 유입 금액
-MIN_LIQUIDITY_20D   = 30_000_000_000  # 20일평균거래대금 300억 (v5.16 500억 → 완화)
+MIN_STOCK_INFLOW    = 3_000_000_000
+MIN_LIQUIDITY_20D   = 30_000_000_000  # 300억
 TOP_ETF_N           = 30
-CANDIDATE_N         = 50              # 후보 종목 수 (v5.16 30 → 확대)
+CANDIDATE_N         = 50              # 후보 50개
 TOP_N               = 30
 LOOKBACK_DAYS       = 7
 DISPARITY_PERIOD    = 20
 DISPARITY_THRESH    = -2.0
-MAX_ETF_STOCKS      = 30              # 집중형 ETF 기준 유지 (수급 임팩트 보존)
+MAX_ETF_STOCKS      = 30              # 집중형 ETF 기준 유지
 INTENSITY_DAYS      = 5
-ETF_POOL_RATIO      = 0.5             # ETF수급강도 상위 50% 후보 풀
+ETF_POOL_RATIO      = 0.5
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
@@ -208,29 +210,43 @@ def get_etf_universe(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict
     return etf_info
 
 
-def get_stock_info_bulk(client: KRXOpenAPI, base_date: str) -> dict:
+def get_stock_info_bulk(client: KRXOpenAPI, base_date: str, retry: int = 1) -> dict:
+    """
+    주식 종목 정보 수집 (KOSPI + KOSDAQ)
+    - 0개 수집 시 retry 1회 (5초 대기 후)
+    - 실패해도 빈 dict 반환 (ETF 수집과 독립적으로 처리)
+    """
     stock_info = {}
-    for get_fn in [client.get_stock_daily_trade, client.get_kosdaq_stock_daily_trade]:
-        try:
-            df = to_df(get_fn(bas_dd=base_date))
-            if df.empty:
-                continue
-            code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
-            name_col = find_col(df, ["ISU_NM"])
-            cap_col  = find_col(df, ["MKTCAP"])
-            if not code_col or not name_col:
-                continue
-            for _, row in df.iterrows():
-                try:
-                    t = str(row[code_col]).strip().zfill(6)
-                    n = str(row[name_col]).strip()
-                    c = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
-                    stock_info[t] = {"name": n, "mktcap": c}
-                except:
+    for attempt in range(retry + 1):
+        stock_info = {}
+        for get_fn in [client.get_stock_daily_trade, client.get_kosdaq_stock_daily_trade]:
+            try:
+                df = to_df(get_fn(bas_dd=base_date))
+                if df.empty:
                     continue
-            time.sleep(0.3)
-        except Exception as e:
-            log(f"  → 주식 조회 오류: {e}")
+                code_col = find_col(df, ["ISU_CD", "ISU_SRT_CD"])
+                name_col = find_col(df, ["ISU_NM"])
+                cap_col  = find_col(df, ["MKTCAP"])
+                if not code_col or not name_col:
+                    continue
+                for _, row in df.iterrows():
+                    try:
+                        t = str(row[code_col]).strip().zfill(6)
+                        n = str(row[name_col]).strip()
+                        c = float(str(row[cap_col]).replace(",", "") or 0) if cap_col else 0
+                        stock_info[t] = {"name": n, "mktcap": c}
+                    except:
+                        continue
+                time.sleep(0.3)
+            except Exception as e:
+                log(f"  → 주식 조회 오류: {e}")
+
+        if stock_info:
+            break
+        elif attempt < retry:
+            log(f"  → 주식 종목 0개 수집, {attempt+1}회 재시도 (5초 대기)...")
+            time.sleep(5)
+
     log(f"  → 주식 종목 {len(stock_info)}개 수집")
     return stock_info
 
@@ -454,6 +470,10 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     log("─" * 40)
     log("[ANALYZE] ETF 수급 스크리너 v5.17 분석")
 
+    # stock_info 0개면 경고만 찍고 계속 (ETF PDF에서 종목명 사용)
+    if not stock_info:
+        log("  ⚠️ 주식 종목 정보 없음 → ETF PDF 종목명으로 대체")
+
     cutoff = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
     cache  = load_aum_cache()
     available_dates = sorted([d for d in cache.keys() if d >= cutoff and d <= base_date])
@@ -514,28 +534,33 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         total_wt = sum(h["weight"] for h in holdings)
         for h in holdings:
             wt = h["weight"] / total_wt if total_wt > 0 else 0
-            stock_inflow[h["ticker"]] = stock_inflow.get(h["ticker"], 0) + inflow * wt
+            # PDF에서 종목명도 같이 저장 (stock_info 없을 때 대비)
+            if h["ticker"] not in stock_inflow:
+                stock_inflow[h["ticker"]] = {"inflow": 0.0, "name_pdf": h["name"]}
+            stock_inflow[h["ticker"]]["inflow"] += inflow * wt
         time.sleep(0.15)
     log(f"  → PDF 성공: {pdf_ok}/{len(top_etfs)} | 집계 종목: {len(stock_inflow)}개")
     if pdf_ok == 0:
         return False
 
     candidates = []
-    for ticker, inflow in stock_inflow.items():
+    for ticker, data in stock_inflow.items():
+        inflow = data["inflow"]
         if inflow < MIN_STOCK_INFLOW:
             continue
-        info = stock_info.get(ticker, {})
-        if not info.get("name"):
-            continue
+        # stock_info 우선, 없으면 PDF 종목명 사용
+        info   = stock_info.get(ticker, {})
+        name   = info.get("name") or data.get("name_pdf") or ticker
+        mktcap = info.get("mktcap", 0)
         candidates.append({
             "ticker": ticker,
-            "name":   info["name"],
+            "name":   name,
             "inflow": inflow,
-            "mktcap": info.get("mktcap", 0),
+            "mktcap": mktcap,
         })
     log(f"  → 후보: {len(candidates)}개")
     candidates.sort(key=lambda x: x["inflow"], reverse=True)
-    top_candidates = candidates[:CANDIDATE_N]   # 상위 50개
+    top_candidates = candidates[:CANDIDATE_N]
 
     investor_days = get_investor_days()
     weekday_name  = ["월", "화", "수", "목", "금"][datetime.today().weekday()]
@@ -592,8 +617,6 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     pool_size = max(1, int(len(valid) * ETF_POOL_RATIO))
     etf_pool  = valid[:pool_size]
     log(f"\n  [1단계] ETF수급강도 전체 {len(valid)}개 → 상위 {pool_size}개 후보 풀 ({int(ETF_POOL_RATIO*100)}%)")
-    for r in etf_pool[:5]:
-        log(f"    {r['name']} | ETF {fmt_pct(r['etf_pct'])}")
 
     etf_pool.sort(key=lambda x: x["flow_score"], reverse=True)
     top = etf_pool[:TOP_N]
@@ -661,8 +684,9 @@ def main():
 
     log("\nKRX 데이터 수집 중...")
     etf_info   = get_etf_universe(krx, base_date, retry=1)
-    stock_info = get_stock_info_bulk(krx, base_date)
+    stock_info = get_stock_info_bulk(krx, base_date, retry=1)  # 실패해도 계속
 
+    # ETF 유니버스만 체크 (stock_info는 독립적으로 처리)
     if not etf_info:
         log("ETF 유니버스 수집 실패. 종료.")
         return
