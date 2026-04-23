@@ -1,0 +1,43 @@
+name: ETF 투자자 수급 수집
+
+on:
+  schedule:
+    # 매 영업일 18:00 KST (09:00 UTC)
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 레포 체크아웃
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 라이브러리 설치
+        run: |
+          pip install requests pandas pykrx
+
+      - name: ETF 투자자 데이터 수집
+        env:
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+        run: |
+          python collect_etf_investor.py
+
+      - name: 데이터 커밋 & 푸시
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add etf_investor_daily.csv
+          git diff --staged --quiet || git commit -m "ETF 투자자 수급 업데이트: $(date +'%Y-%m-%d')"
+          git push
