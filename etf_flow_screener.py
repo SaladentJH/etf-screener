@@ -1,10 +1,12 @@
 """
-ETF 수급 기반 종목 스크리너 v5.19
+ETF 수급 기반 종목 스크리너 v5.20
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경사항 (v5.19):
-  - MIN_ETF_INTENSITY 추가: ETF수급강도 10% 미만 제외
-  - 필터 순서: ETF유입 100억↑ AND ETF수급강도 10%↑ → ETF수급강도 내림차순
+변경사항 (v5.20):
+  - get_etf_components_kis: 빈 결과 시 최대 3회 재시도 (1초 대기)
+  - ETF 구성종목 API 호출 간격 0.15s → 0.5s
+  - PDF 성공률 50% 미만 시 텔레그램 경고 발송
+  - 텔레그램 헤더에 PDF 성공률 표시
 """
 
 import os
@@ -26,18 +28,21 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW    = 10_000_000_000  # ETF유입 최소 100억
-MIN_ETF_INTENSITY   = 10.0            # ETF수급강도 최소 10%
-MIN_LIQUIDITY_20D   = 30_000_000_000  # 거래대금 20일평균 최소 300억
-TOP_ETF_N           = 30
-CANDIDATE_N         = 50
-TOP_N               = 30
-LOOKBACK_DAYS       = 7               # 캘린더 7일 윈도우 (공휴일/주말 대응)
-DISPARITY_PERIOD    = 20
-DISPARITY_THRESH    = -2.0
-MAX_ETF_STOCKS      = 30
-INTENSITY_DAYS      = 5
-KRX_MAX_FALLBACK    = 5
+MIN_STOCK_INFLOW       = 10_000_000_000  # ETF유입 최소 100억
+MIN_ETF_INTENSITY      = 10.0            # ETF수급강도 최소 10%
+MIN_LIQUIDITY_20D      = 30_000_000_000  # 거래대금 20일평균 최소 300억
+TOP_ETF_N              = 30
+CANDIDATE_N            = 50
+TOP_N                  = 30
+LOOKBACK_DAYS          = 7               # 캘린더 7일 윈도우 (공휴일/주말 대응)
+DISPARITY_PERIOD       = 20
+DISPARITY_THRESH       = -2.0
+MAX_ETF_STOCKS         = 30
+INTENSITY_DAYS         = 5
+KRX_MAX_FALLBACK       = 5
+ETF_COMPONENT_RETRY    = 3               # 구성종목 API 재시도 횟수
+ETF_COMPONENT_SLEEP    = 0.5             # 구성종목 API 호출 간격(초)
+PDF_WARN_THRESHOLD     = 0.5             # PDF 성공률 경고 기준 (50%)
 
 INVESTOR_DAYS_BY_WEEKDAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 WEEKDAY_NAME             = {0: "월", 1: "화", 2: "수", 3: "목", 4: "금"}
@@ -282,21 +287,34 @@ def get_etf_data_today(etf_tickers: list, token: str) -> dict:
     return result
 
 
-# ─── KIS ETF 구성종목 ─────────────────────────────────
+# ─── KIS ETF 구성종목 (재시도 포함) ──────────────────────
 
 def get_etf_components_kis(etf_ticker: str, token: str) -> list:
-    data = kis_get(
-        "/uapi/etfetn/v1/quotations/inquire-component-stock-price", "FHKST121600C0",
-        {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": etf_ticker, "FID_COND_SCR_DIV_CODE": "11216"}, token,
-    )
-    holdings = []
-    for row in data.get("output2", []):
-        code   = str(row.get("stck_shrn_iscd", "")).strip().zfill(6)
-        name   = str(row.get("hts_kor_isnm", "")).strip()
-        weight = float(str(row.get("etf_cnfg_issu_rlim", 0) or 0))
-        if len(code) == 6 and code.isdigit() and weight > 0:
-            holdings.append({"ticker": code, "name": name, "weight": weight})
-    return holdings
+    """
+    ETF 구성종목 조회. 빈 결과 시 최대 ETF_COMPONENT_RETRY회 재시도 (1초 대기).
+    """
+    for attempt in range(ETF_COMPONENT_RETRY + 1):
+        data = kis_get(
+            "/uapi/etfetn/v1/quotations/inquire-component-stock-price", "FHKST121600C0",
+            {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": etf_ticker, "FID_COND_SCR_DIV_CODE": "11216"},
+            token,
+        )
+        holdings = []
+        for row in data.get("output2", []):
+            code   = str(row.get("stck_shrn_iscd", "")).strip().zfill(6)
+            name   = str(row.get("hts_kor_isnm", "")).strip()
+            weight = float(str(row.get("etf_cnfg_issu_rlim", 0) or 0))
+            if len(code) == 6 and code.isdigit() and weight > 0:
+                holdings.append({"ticker": code, "name": name, "weight": weight})
+
+        if holdings:
+            return holdings
+
+        if attempt < ETF_COMPONENT_RETRY:
+            log(f"  → {etf_ticker} 구성종목 없음, {attempt + 1}회 재시도 (1초 대기)...")
+            time.sleep(1.0)
+
+    return []
 
 
 # ─── KIS 투자자별 순매수 ──────────────────────────────
@@ -451,7 +469,7 @@ def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
 
 def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) -> bool:
     log("─" * 40)
-    log("[ANALYZE] ETF 수급 스크리너 v5.19 분석")
+    log("[ANALYZE] ETF 수급 스크리너 v5.20 분석")
 
     if not stock_info:
         log("  ⚠️ 주식 종목 정보 없음 → ETF PDF 종목명으로 대체")
@@ -508,7 +526,8 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     for etf_ticker, inflow in top_etfs:
         holdings = get_etf_components_kis(etf_ticker, token)
         if not holdings:
-            time.sleep(0.2)
+            log(f"  ⚠️ {etf_ticker} 구성종목 최종 실패 (재시도 소진)")
+            time.sleep(ETF_COMPONENT_SLEEP)
             continue
         pdf_ok += 1
         total_wt = sum(h["weight"] for h in holdings)
@@ -517,8 +536,21 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
             if h["ticker"] not in stock_inflow:
                 stock_inflow[h["ticker"]] = {"inflow": 0.0, "name_pdf": h["name"]}
             stock_inflow[h["ticker"]]["inflow"] += inflow * wt
-        time.sleep(0.15)
-    log(f"  → PDF 성공: {pdf_ok}/{len(top_etfs)} | 집계 종목: {len(stock_inflow)}개")
+        time.sleep(ETF_COMPONENT_SLEEP)
+
+    pdf_rate = pdf_ok / len(top_etfs) if top_etfs else 0
+    log(f"  → PDF 성공: {pdf_ok}/{len(top_etfs)} ({pdf_rate*100:.0f}%) | 집계 종목: {len(stock_inflow)}개")
+
+    # PDF 성공률 낮으면 텔레그램 경고
+    if pdf_rate < PDF_WARN_THRESHOLD:
+        warn_msg = (
+            f"⚠️ <b>ETF 구성종목 수집 경고</b>\n"
+            f"PDF 성공률 {pdf_rate*100:.0f}% ({pdf_ok}/{len(top_etfs)}) — 결과가 불완전할 수 있습니다.\n"
+            f"KIS API rate limit 또는 TR_ID 오류를 확인하세요."
+        )
+        send_telegram(warn_msg)
+        log(f"  ⚠️ PDF 성공률 {pdf_rate*100:.0f}% < {PDF_WARN_THRESHOLD*100:.0f}% → 텔레그램 경고 발송")
+
     if pdf_ok == 0:
         return False
 
@@ -541,8 +573,8 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     liq_label     = fmt(MIN_LIQUIDITY_20D)
     log(f"\n이격도 + 거래대금 + 투자자({investor_days}일) 수집 중...")
 
-    results         = []
-    liq_filtered    = 0
+    results            = []
+    liq_filtered       = 0
     intensity_filtered = 0
     for c in top_candidates:
         ticker     = c["ticker"]
@@ -599,9 +631,10 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     # ── 텔레그램 ──
     divider = "─" * 20
     now_kst = kst_now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.19</b>\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.20</b>\n"
     msg += f"🗓 {now_kst} KST  |  분석: {period_str} ({len(available_dates)}일)\n"
     msg += f"📌 집중형 ETF {len(top_etfs)}개 순유입 → <b>{len(top)}개 종목</b>\n"
+    msg += f"🔎 PDF 성공률: {pdf_ok}/{len(top_etfs)} ({pdf_rate*100:.0f}%)\n"
     msg += f"💧 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})\n"
     msg += f"⚡ ETF수급강도 필터 제외: {intensity_filtered}개 (< {MIN_ETF_INTENSITY}%)\n"
     msg += f"🔢 정렬: ETF유입 100억↑ & ETF수급강도 {MIN_ETF_INTENSITY}%↑ → ETF수급강도 내림차순\n"
@@ -641,7 +674,7 @@ def main():
 
     base_date = get_recent_business_day(1)
     log("=" * 50)
-    log(f"ETF 수급 스크리너 v5.19 | 기준일: {base_date} (KST)")
+    log(f"ETF 수급 스크리너 v5.20 | 기준일: {base_date} (KST)")
     log("=" * 50)
 
     log("KIS 토큰 발급 중...")
