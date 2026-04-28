@@ -1,14 +1,10 @@
 """
-ETF 수급 기반 종목 스크리너 v5.18
+ETF 수급 기반 종목 스크리너 v5.19
 미래에셋증권 "신(新) 수급의 시대" 전략 구현
 
-변경사항 (v5.18):
-  - MIN_STOCK_INFLOW: 30억 → 100억
-  - 정렬 로직 변경: ETF수급강도(etf_pct) 단일 기준 내림차순
-    (기존: ETF수급강도 상위 50% 풀 → 수급점수(외국인+개인) 내림차순)
-  - ETF_POOL_RATIO / flow_score / calc_flow_score 제거
-  - 외국인+개인은 참고용 표시만 유지
-  - LOOKBACK_DAYS=7 유지 (공휴일/주말 대응 유동적 캐시 설계)
+변경사항 (v5.19):
+  - MIN_ETF_INTENSITY 추가: ETF수급강도 10% 미만 제외
+  - 필터 순서: ETF유입 100억↑ AND ETF수급강도 10%↑ → ETF수급강도 내림차순
 """
 
 import os
@@ -30,8 +26,9 @@ KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
 AUM_CACHE_FILE = "etf_aum_cache.json"
 
 # ─── 분석 파라미터 ─────────────────────────────────────
-MIN_STOCK_INFLOW    = 10_000_000_000  # 100억 (기존 30억)
-MIN_LIQUIDITY_20D   = 30_000_000_000  # 300억
+MIN_STOCK_INFLOW    = 10_000_000_000  # ETF유입 최소 100억
+MIN_ETF_INTENSITY   = 10.0            # ETF수급강도 최소 10%
+MIN_LIQUIDITY_20D   = 30_000_000_000  # 거래대금 20일평균 최소 300억
 TOP_ETF_N           = 30
 CANDIDATE_N         = 50
 TOP_N               = 30
@@ -454,7 +451,7 @@ def run_collect(etf_info: dict, token: str, base_date: str) -> bool:
 
 def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) -> bool:
     log("─" * 40)
-    log("[ANALYZE] ETF 수급 스크리너 v5.18 분석")
+    log("[ANALYZE] ETF 수급 스크리너 v5.19 분석")
 
     if not stock_info:
         log("  ⚠️ 주식 종목 정보 없음 → ETF PDF 종목명으로 대체")
@@ -525,7 +522,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     if pdf_ok == 0:
         return False
 
-    # ── ETF유입 100억 이상 필터 ──
+    # ── 1차 필터: ETF유입 100억 이상 ──
     candidates = []
     for ticker, data in stock_inflow.items():
         inflow = data["inflow"]
@@ -535,7 +532,7 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         name   = info.get("name") or data.get("name_pdf") or ticker
         mktcap = info.get("mktcap", 0)
         candidates.append({"ticker": ticker, "name": name, "inflow": inflow, "mktcap": mktcap})
-    log(f"  → ETF유입 100억↑ 후보: {len(candidates)}개")
+    log(f"  → 1차 필터(ETF유입 100억↑): {len(candidates)}개")
     candidates.sort(key=lambda x: x["inflow"], reverse=True)
     top_candidates = candidates[:CANDIDATE_N]
 
@@ -544,8 +541,9 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
     liq_label     = fmt(MIN_LIQUIDITY_20D)
     log(f"\n이격도 + 거래대금 + 투자자({investor_days}일) 수집 중...")
 
-    results      = []
-    liq_filtered = 0
+    results         = []
+    liq_filtered    = 0
+    intensity_filtered = 0
     for c in top_candidates:
         ticker     = c["ticker"]
         price_data = get_disparity_and_volume(ticker, token)
@@ -553,12 +551,20 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         vol_5d_avg  = price_data["vol_5d_avg"]
         vol_20d_avg = price_data["vol_20d_avg"]
 
+        # 유동성 필터
         if vol_20d_avg > 0 and vol_20d_avg < MIN_LIQUIDITY_20D:
             liq_filtered += 1
             time.sleep(0.05)
             continue
 
-        etf_pct  = (c["inflow"] / vol_5d_avg * 100) if vol_5d_avg > 0 else None
+        etf_pct = (c["inflow"] / vol_5d_avg * 100) if vol_5d_avg > 0 else None
+
+        # ── 2차 필터: ETF수급강도 10% 이상 ──
+        if etf_pct is None or etf_pct < MIN_ETF_INTENSITY:
+            intensity_filtered += 1
+            time.sleep(0.05)
+            continue
+
         investor = get_investor_net_buy_daily(ticker, token, display_days=investor_days)
         f5 = investor["frgn_5d_avg"]
         p5 = investor["prsn_5d_avg"]
@@ -581,23 +587,24 @@ def run_analyze(etf_info: dict, stock_info: dict, token: str, base_date: str) ->
         time.sleep(0.15)
 
     log(f"  → 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})")
+    log(f"  → ETF수급강도 필터 제외: {intensity_filtered}개 (< {MIN_ETF_INTENSITY}%)")
 
     # ── 단일 정렬: ETF수급강도 내림차순 ──
-    valid = [r for r in results if r["etf_pct"] is not None]
-    valid.sort(key=lambda x: x["etf_pct"], reverse=True)
-    top = valid[:TOP_N]
-    log(f"\n  ETF수급강도 내림차순 → 최종 {len(top)}개")
+    results.sort(key=lambda x: x["etf_pct"], reverse=True)
+    top = results[:TOP_N]
+    log(f"\n  최종 {len(top)}개 (ETF수급강도 내림차순)")
     for r in top[:5]:
         log(f"    {r['name']} | ETF수급강도 {fmt_pct(r['etf_pct'])} | {r['case_tag']}")
 
     # ── 텔레그램 ──
     divider = "─" * 20
     now_kst = kst_now().strftime("%Y/%m/%d %H:%M")
-    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.18</b>\n"
+    msg  = f"📊 <b>ETF 수급 종목 스크리너 v5.19</b>\n"
     msg += f"🗓 {now_kst} KST  |  분석: {period_str} ({len(available_dates)}일)\n"
     msg += f"📌 집중형 ETF {len(top_etfs)}개 순유입 → <b>{len(top)}개 종목</b>\n"
-    msg += f"💧 거래대금 {liq_label} 미만 제외 {liq_filtered}개\n"
-    msg += f"🔢 정렬: ETF유입 100억↑ → ETF수급강도 내림차순\n"
+    msg += f"💧 유동성 필터 제외: {liq_filtered}개 (20일평균 < {liq_label})\n"
+    msg += f"⚡ ETF수급강도 필터 제외: {intensity_filtered}개 (< {MIN_ETF_INTENSITY}%)\n"
+    msg += f"🔢 정렬: ETF유입 100억↑ & ETF수급강도 {MIN_ETF_INTENSITY}%↑ → ETF수급강도 내림차순\n"
     msg += f"외인/개인: {weekday_name}요일 기준 {investor_days}영업일 (참고)\n"
     msg += "━" * 24 + "\n\n"
 
@@ -634,7 +641,7 @@ def main():
 
     base_date = get_recent_business_day(1)
     log("=" * 50)
-    log(f"ETF 수급 스크리너 v5.18 | 기준일: {base_date} (KST)")
+    log(f"ETF 수급 스크리너 v5.19 | 기준일: {base_date} (KST)")
     log("=" * 50)
 
     log("KIS 토큰 발급 중...")
