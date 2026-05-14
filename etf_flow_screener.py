@@ -652,9 +652,11 @@ def main():
         log("COLLECT 실패. ANALYZE 스킵.")
         return
 
-    log("")
-    run_analyze(etf_info, stock_info, token, actual_date)
-    log("\n완료!")
+    # ── ANALYZE 비활성화 (텔레그램 발송 중단, 수급 수집만 유지) ──
+    # log("")
+    # run_analyze(etf_info, stock_info, token, actual_date)
+
+    log("\n완료! (COLLECT 전용 모드)")
 
 
 if __name__ == "__main__":
