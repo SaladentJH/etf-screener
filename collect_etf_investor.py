@@ -38,18 +38,28 @@ def get_recent_business_day():
 
 
 def get_kis_token():
-    r = requests.post(
-        f"{KIS_BASE_URL}/oauth2/tokenP",
-        json={
-            "grant_type": "client_credentials",
-            "appkey": KIS_APP_KEY,
-            "appsecret": KIS_APP_SECRET,
-        },
-        timeout=10,
-    )
-    token = r.json().get("access_token", "")
-    assert token, f"토큰 발급 실패: {r.json()}"
-    return token
+    # 일시적 연결 타임아웃/네트워크 오류 대비 최대 3회 재시도 (간격 5초)
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                f"{KIS_BASE_URL}/oauth2/tokenP",
+                json={
+                    "grant_type": "client_credentials",
+                    "appkey": KIS_APP_KEY,
+                    "appsecret": KIS_APP_SECRET,
+                },
+                timeout=15,
+            )
+            token = r.json().get("access_token", "")
+            if token:
+                return token
+            last_err = f"토큰 발급 실패: {r.json()}"
+        except requests.exceptions.RequestException as e:
+            last_err = e
+        log(f"  토큰 발급 재시도 {attempt}/3 (사유: {last_err})")
+        time.sleep(5)
+    raise RuntimeError(f"KIS 토큰 발급 3회 실패: {last_err}")
 
 
 def get_etf_investor(ticker, token):
